@@ -1,0 +1,39 @@
+{
+  "name": "sync-sqlite",
+  "version": "1.0.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "test": "vitest",
+    "dev": "vite",
+    "build-wasm": "wasm-pack build ./rust --target web --out-dir ../src/sync_sqlite --out-name sync_sqlite",
+    "build": "pnpm build-wasm && tsc && cp -r src/sync_sqlite dist/sync_sqlite && rm dist/sync_sqlite/.gitignore"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.5.3",
+      "onFail": "download"
+    }
+  },
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.2",
+    "vite-plugin-wasm": "^3.6.0",
+    "vitest": "^5.0.3"
+  }
+}
