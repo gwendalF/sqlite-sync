@@ -21,6 +21,8 @@ export type WorkerMethods = {
     args: Query;
     result: { rows: unknown[]; isReadonly: boolean };
   };
+  begin: { args: void; result: void };
+  commit: { args: void; result: void };
   rollback: { args: void; result: void };
 };
 export type Method = keyof WorkerMethods;

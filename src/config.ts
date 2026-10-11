@@ -20,4 +20,10 @@ export type Config<M extends MutatorsConfig = MutatorsConfig> = {
   db: string;
   puller: Puller;
   mutators: M;
+  migrations?: Migration[];
+};
+
+export type Migration = {
+  version: number;
+  run: (db: DBHandle) => Promise<void>;
 };

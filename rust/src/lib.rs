@@ -401,6 +401,18 @@ impl SqliteEngine {
     }
 
     #[wasm_bindgen]
+    pub fn begin(&self) -> Result<()> {
+        self.connection.execute("BEGIN", ())?;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn commit(&self) -> Result<()> {
+        self.connection.execute("COMMIT", ())?;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
     pub fn end_mutate(&mut self, name: &str, args: &str) -> Result<()> {
         match self.push_state {
             PushState::Idle => return Err(WasmError::Other(String::from("not in mutation"))),

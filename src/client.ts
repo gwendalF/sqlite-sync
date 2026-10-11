@@ -1,4 +1,10 @@
-import { Config, MutatorsConfig, PublicMutators } from "./config";
+import {
+  Config,
+  DBHandle,
+  Migration,
+  MutatorsConfig,
+  PublicMutators,
+} from "./config";
 import type {
   ChannelMessage,
   ChannelRequest,
@@ -33,13 +39,50 @@ export class SyncEngine<M extends MutatorsConfig> {
   private rawMutators: PublicMutators<M>;
   mutate: PublicMutators<M>;
 
+  private async applyMigrations(migrations: Migration[]) {
+    const dbHandle: DBHandle = {
+      sql: async (query) => {
+        const { rows } = await this.sql(query);
+        return rows;
+      },
+    };
+
+    let {
+      rows: [version],
+    } = await this.sql<number>({
+      sql: "SELECT * FROM pragma_user_version",
+      params: [],
+    });
+    console.log("Base version", version);
+    this.call("begin", undefined);
+    try {
+      for (const migration of migrations) {
+        if (migration.version <= version) {
+          continue;
+        }
+
+        version += 1;
+        await migration.run(dbHandle);
+        await this.sql({
+          sql: "PRAGMA user_version = ?",
+          params: [version],
+        });
+      }
+    } catch (e) {
+      this.call("rollback", undefined);
+      console.warn(e);
+    }
+
+    this.call("commit", undefined);
+  }
+
   private constructor(channel: BroadcastChannel, config: Config<M>) {
     this.puller = config.puller;
 
     const mutators = {} as PublicMutators<M>;
     const rawMutators = {} as PublicMutators<M>;
 
-    const makeDbHandle = (updatedTables: Set<string>) => {
+    const makeDbHandle = (updatedTables: Set<string>): DBHandle => {
       return {
         sql: async (query: Query): Promise<unknown[]> => {
           const { rows, tables, isReadonly } = await this.sql(query, true);
@@ -117,7 +160,12 @@ export class SyncEngine<M extends MutatorsConfig> {
       channel.postMessage({ type: "hello" } satisfies ChannelMessage);
     });
 
-    return new SyncEngine(channel, config);
+    const engine = new SyncEngine(channel, config);
+    if (config.migrations) {
+      await engine.applyMigrations(config.migrations);
+    }
+
+    return engine;
   }
 
   private static async claimLeaderShip(dbConfig: string) {
@@ -191,7 +239,6 @@ export class SyncEngine<M extends MutatorsConfig> {
     }
 
     const result = await this.call("query", query);
-
     return {
       rows: result.rows as T[],
       isReadonly: result.isReadonly,
@@ -284,11 +331,11 @@ export class SyncEngine<M extends MutatorsConfig> {
   }
 
   async sync() {
+    const request = await this.call("beginPull", undefined);
+    const response = await this.puller.pull(request.server_version);
+    const endVersion = response.server_version;
     await this.task(async () => {
       try {
-        const request = await this.call("beginPull", undefined);
-        const response = await this.puller.pull(request.server_version);
-        const endVersion = response.server_version;
         const mutations = await this.call("startRebase", response);
         for (const mutation of mutations) {
           await this.rawMutators[mutation.name](mutation.args);

@@ -15,6 +15,8 @@ const makeHandlers = (engine: SqliteEngine): WorkerHandlers => ({
   endRebase: (version: number) => engine.endRebasing(version),
   startRebase: (response: wasm.PullResponse) => engine.startRebasing(response),
   query: (query: Query) => engine.rawQuery(query.sql, query.params),
+  begin: () => engine.begin(),
+  commit: () => engine.commit(),
   rollback: () => engine.rollback(),
 });
 
@@ -25,11 +27,12 @@ class SqliteEngine {
     await init();
 
     const rustEngine = await wasm.SqliteEngine.create(name);
+    console.log({ rustEngine });
     const engine = new SqliteEngine(rustEngine);
     return engine;
   }
 
-  public rawQuery(
+  rawQuery(
     sql: string,
     params: unknown[] = [],
   ): { rows: Record<string, unknown>[]; isReadonly: boolean } {
@@ -37,28 +40,36 @@ class SqliteEngine {
     return { rows, isReadonly: is_readonly };
   }
 
-  public beginPull(): wasm.PullRequest {
+  beginPull(): wasm.PullRequest {
     return this.rustEngine.begin_pull();
   }
 
-  public startRebasing(pullResponse: wasm.PullResponse): wasm.LocalMutation[] {
+  startRebasing(pullResponse: wasm.PullResponse): wasm.LocalMutation[] {
     return this.rustEngine.start_rebasing(pullResponse);
   }
 
-  public endRebasing(serverVersion: number) {
+  endRebasing(serverVersion: number) {
     return this.rustEngine.end_rebasing(serverVersion);
   }
 
-  public startMutation() {
+  startMutation() {
     return this.rustEngine.start_mutate();
   }
 
-  public completeMutation(name: string, args: unknown) {
+  completeMutation(name: string, args: unknown) {
     this.rustEngine.end_mutate(name, JSON.stringify(args));
   }
 
-  public rollback() {
+  rollback() {
     return this.rustEngine.rollback();
+  }
+
+  begin() {
+    return this.rustEngine.begin();
+  }
+
+  commit() {
+    return this.rustEngine.commit();
   }
 }
 
