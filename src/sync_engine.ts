@@ -1,5 +1,12 @@
-import { Config, DBHandle, Migration, MutatorsConfig, Query } from "./config";
-import { Method, RpcMethods } from "./messages";
+import {
+  Config,
+  DBHandle,
+  Migration,
+  MigrationHandle,
+  MutatorsConfig,
+  Query,
+} from "./config";
+import { Method, RpcArgs, RpcMethods } from "./messages";
 import { System } from "./system";
 
 export class SyncEngine<M extends MutatorsConfig> {
@@ -15,29 +22,49 @@ export class SyncEngine<M extends MutatorsConfig> {
     config: Config<M>,
   ) {
     const engine = new SyncEngine(system, config);
+    if (config.migrations?.length) {
+      await engine.applyMigrations(config.migrations);
+    }
 
     return engine;
   }
 
-  private async sql<T = unknown>(query: Query) {
+  async sql<T = unknown>(query: Query) {
     return this.system.call("query", query) as Promise<{
       rows: T[];
       isReadonly: boolean;
     }>;
   }
 
-  private async call<M extends Method>(
-    method: M,
-    args: RpcMethods[M]["args"],
-  ) {}
+  private async call<M extends Method>(method: M, ...args: RpcArgs<M>) {
+    return this.system.call(method, ...args);
+  }
 
   private async applyMigrations(migrations: Migration[]) {
-    const dbHandle: DBHandle = {
-      sql: async (query) => {
-        const { rows } = await this.sql(query);
-        return rows;
-      },
-    };
+    migrations.sort((a, b) => a.version - b.version);
+    return this.system.lock(async () => {
+      let {
+        rows: [version],
+      } = await this.sql<number>({
+        sql: "SELECT * FROM pragma_user_version",
+      });
+
+      for (const migration of migrations) {
+        if (migration.version > version) {
+          const dbHandle: MigrationHandle = {
+            exec: async (query) => {
+              await this.call("execMigration", {
+                userVersion: version + 1,
+                batch: query,
+              });
+            },
+          };
+
+          await migration.run(dbHandle);
+          version += 1;
+        }
+      }
+    });
   }
 
   private async tablesOf(sql: string): Promise<string[]> {

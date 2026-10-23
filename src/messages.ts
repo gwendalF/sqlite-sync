@@ -8,7 +8,7 @@ export type ErrorCode = "INITIALISATION_NOT_DONE" | "RUNTIME_ERROR";
 
 export type Query = {
   sql: string;
-  params: unknown[];
+  params?: unknown[];
 };
 
 export type RpcMethods = {
@@ -21,10 +21,13 @@ export type RpcMethods = {
     args: Query;
     result: { rows: unknown[]; isReadonly: boolean };
   };
+  execMigration: {
+    args: { userVersion: number; batch: string };
+    result: void;
+  };
   begin: { args: void; result: void };
   commit: { args: void; result: void };
   rollback: { args: void; result: void };
-  updateUserVersion: { args: number; result: void };
   export: { args: void; result: Uint8Array<ArrayBuffer> };
   close: { args: void; result: void };
 };
@@ -35,6 +38,12 @@ export type RpcHandlers = {
     args: RpcMethods[M]["args"],
   ) => RpcMethods[M]["result"] | Promise<RpcMethods[M]["result"]>;
 };
+
+export type RpcArgs<M extends Method> = RpcMethods[M]["args"] extends
+  | void
+  | undefined
+  ? [args?: undefined]
+  : [args: RpcMethods[M]["args"]];
 
 export type SerializedError = {
   message: string;

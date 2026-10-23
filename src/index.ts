@@ -1,4 +1,4 @@
-export { SyncEngine } from "./client";
+export { SyncEngine } from "./sync_engine";
 export type {
   Config,
   PublicMutators,

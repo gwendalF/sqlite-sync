@@ -5,6 +5,10 @@ export type DBHandle = {
   sql: (query: Query) => Promise<unknown[]>;
 };
 
+export type MigrationHandle = {
+  exec: (migration: string) => Promise<void>;
+};
+
 export type MutatorFn<P = any> = (db: DBHandle, payload: P) => Promise<void>;
 export type MutatorsConfig = Record<string, MutatorFn<any>>;
 
@@ -25,7 +29,7 @@ export type Config<M extends MutatorsConfig = MutatorsConfig> = {
 
 export type Migration = {
   version: number;
-  run: (db: DBHandle) => Promise<void>;
+  run: (db: MigrationHandle) => Promise<void>;
 };
 
 export { Puller, Query };

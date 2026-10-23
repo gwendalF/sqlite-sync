@@ -271,6 +271,15 @@ impl SqliteEngine {
         Ok(result.into())
     }
 
+    #[wasm_bindgen]
+    pub fn exec_migration(&mut self, batch: &str, user_version: u32) -> Result<()> {
+        let tx = self.connection.transaction()?;
+        tx.execute_batch(batch)?;
+        tx.pragma_update(None, "user_version", user_version)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn rusqlite_to_serde<'a>(
         &self,
         row: &rusqlite::Row<'a>,
@@ -417,13 +426,6 @@ impl SqliteEngine {
     #[wasm_bindgen]
     pub fn commit(&self) -> Result<()> {
         self.connection.execute("COMMIT", ())?;
-        Ok(())
-    }
-
-    #[wasm_bindgen]
-    pub fn update_user_version(&self, version: i32) -> Result<()> {
-        self.connection
-            .pragma_update(None, "user_version", version)?;
         Ok(())
     }
 
