@@ -115,7 +115,7 @@ pub struct PullResponse {
 #[derive(Serialize)]
 pub struct LocalMutation {
     name: String,
-    args: serde_json::Value,
+    args: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -133,13 +133,15 @@ pub struct TableMutation {
     records: Vec<BTreeMap<String, serde_json::Value>>,
 }
 
+#[derive(Clone)]
 pub struct Mutation {
     id: usize,
     name: String,
-    args: serde_json::Value,
+    args: Option<serde_json::Value>,
     changeset: Vec<u8>,
 }
 
+#[derive(Debug)]
 enum PullState {
     Idle,
     Awaiting,
@@ -171,8 +173,10 @@ impl<'a> From<RollbackErr<'a>> for WasmError {
 impl SqliteEngine {
     #[wasm_bindgen]
     pub async fn create(db_path: &str) -> Result<Self> {
-        sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(&OpfsSAHPoolCfg::default(), true)
-            .await?;
+        if !db_path.contains(":memory:") {
+            sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(&OpfsSAHPoolCfg::default(), true)
+                .await?;
+        }
 
         let conn = rusqlite::Connection::open(db_path)?;
 
@@ -224,6 +228,11 @@ impl SqliteEngine {
         })
     }
 
+    #[wasm_bindgen]
+    pub fn free(self) {
+        drop(self);
+    }
+
     #[wasm_bindgen(getter)]
     pub fn client_id(&self) -> String {
         self.client_id.clone()
@@ -234,7 +243,6 @@ impl SqliteEngine {
         let query: SqlQuery = serde_wasm_bindgen::from_value(query.into())?;
         let mut stmt = self.connection.prepare_cached(&query.sql)?;
         let is_readonly = stmt.readonly();
-
         let cols: Vec<_> = stmt.column_names().iter().map(|&c| c.to_string()).collect();
 
         let rows: Vec<_> = stmt
@@ -413,7 +421,14 @@ impl SqliteEngine {
     }
 
     #[wasm_bindgen]
-    pub fn end_mutate(&mut self, name: &str, args: &str) -> Result<()> {
+    pub fn update_user_version(&self, version: i32) -> Result<()> {
+        self.connection
+            .pragma_update(None, "user_version", version)?;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn end_mutate(&mut self, name: &str, args: Option<String>) -> Result<()> {
         match self.push_state {
             PushState::Idle => return Err(WasmError::Other(String::from("not in mutation"))),
             PushState::InProgress { session } => {
@@ -442,6 +457,12 @@ impl SqliteEngine {
         Ok(())
     }
 
+    #[wasm_bindgen]
+    pub fn export_db(&self) -> Result<Vec<u8>> {
+        let data = self.connection.serialize("main")?;
+        Ok(data.to_vec())
+    }
+
     fn rever_changesets(&self, last_mutation_id: usize) -> rusqlite::Result<Vec<Mutation>> {
         let mut stmt = self.connection.prepare_cached(
             "SELECT id, name, json(args), changeset FROM pending_mutations ORDER by id DESC",
@@ -449,19 +470,25 @@ impl SqliteEngine {
 
         let mut changes: Vec<Mutation> = stmt
             .query_map((), |row| {
-                let args = row.get_ref(2)?.as_str()?;
-                let args = serde_json::from_str(args).map_err(|e| {
-                    rusqlite::Error::InvalidColumnType(
-                        1,
-                        e.to_string(),
-                        rusqlite::types::Type::Text,
-                    )
-                })?;
+                let args = row.get_ref(2)?.as_str_or_null()?;
+                let value = match args {
+                    Some(args) => {
+                        let value = serde_json::from_str(args).map_err(|e| {
+                            rusqlite::Error::InvalidColumnType(
+                                1,
+                                e.to_string(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?;
+                        Some(value)
+                    }
+                    None => None,
+                };
 
                 Ok(Mutation {
                     id: row.get::<_, i64>(0)? as usize,
                     name: row.get(1)?,
-                    args,
+                    args: value,
                     changeset: row.get(3)?,
                 })
             })?

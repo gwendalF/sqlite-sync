@@ -11,7 +11,7 @@ export type Query = {
   params: unknown[];
 };
 
-export type WorkerMethods = {
+export type RpcMethods = {
   startMutate: { args: void; result: void };
   endMutate: { args: { name: string; args: unknown }; result: void };
   beginPull: { args: void; result: PullRequest };
@@ -24,13 +24,16 @@ export type WorkerMethods = {
   begin: { args: void; result: void };
   commit: { args: void; result: void };
   rollback: { args: void; result: void };
+  updateUserVersion: { args: number; result: void };
+  export: { args: void; result: Uint8Array<ArrayBuffer> };
+  close: { args: void; result: void };
 };
-export type Method = keyof WorkerMethods;
+export type Method = keyof RpcMethods;
 
-export type WorkerHandlers = {
+export type RpcHandlers = {
   [M in Method]: (
-    args: WorkerMethods[M]["args"],
-  ) => WorkerMethods[M]["result"] | Promise<WorkerMethods[M]["result"]>;
+    args: RpcMethods[M]["args"],
+  ) => RpcMethods[M]["result"] | Promise<RpcMethods[M]["result"]>;
 };
 
 export type SerializedError = {
@@ -46,7 +49,7 @@ export type WorkerRequest =
         type: "request";
         id: string;
         method: M;
-        args: WorkerMethods[M]["args"];
+        args: RpcMethods[M]["args"];
       };
     }[Method];
 
@@ -61,7 +64,7 @@ export type ChannelRequest = {
     type: "request";
     id: string;
     method: M;
-    args: WorkerMethods[M]["args"];
+    args: RpcMethods[M]["args"];
   };
 }[Method];
 

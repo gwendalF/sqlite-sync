@@ -9,10 +9,10 @@ export type MutatorFn<P = any> = (db: DBHandle, payload: P) => Promise<void>;
 export type MutatorsConfig = Record<string, MutatorFn<any>>;
 
 export type PublicMutators<M extends MutatorsConfig> = {
-  [K in keyof M]: M[K] extends (db: DBHandle, payload: infer P) => void
-    ? (payload: P) => Promise<void>
-    : M[K] extends (db: DBHandle) => Promise<void>
-      ? () => Promise<void>
+  [K in keyof M]: M[K] extends (db: DBHandle) => unknown
+    ? () => Promise<void>
+    : M[K] extends (db: DBHandle, payload: infer P) => unknown
+      ? (payload: P) => Promise<void>
       : never;
 };
 
@@ -27,3 +27,5 @@ export type Migration = {
   version: number;
   run: (db: DBHandle) => Promise<void>;
 };
+
+export { Puller, Query };

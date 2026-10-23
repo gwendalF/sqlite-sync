@@ -11,7 +11,7 @@ import type {
   Method,
   Query,
   UpdateMessage,
-  WorkerMethods,
+  RpcMethods,
   WorkerRequest,
   WorkerResponse,
 } from "./messages";
@@ -53,7 +53,7 @@ export class SyncEngine<M extends MutatorsConfig> {
       sql: "SELECT * FROM pragma_user_version",
       params: [],
     });
-    console.log("Base version", version);
+
     this.call("begin", undefined);
     try {
       for (const migration of migrations) {
@@ -63,10 +63,7 @@ export class SyncEngine<M extends MutatorsConfig> {
 
         version += 1;
         await migration.run(dbHandle);
-        await this.sql({
-          sql: "PRAGMA user_version = ?",
-          params: [version],
-        });
+        await this.call("updateUserVersion", version);
       }
     } catch (e) {
       this.call("rollback", undefined);
@@ -112,7 +109,6 @@ export class SyncEngine<M extends MutatorsConfig> {
           }
 
           await this.call("endMutate", { name: key, args: payload });
-
           this.dispatchListeners(updatedTables);
         });
       };
@@ -125,10 +121,10 @@ export class SyncEngine<M extends MutatorsConfig> {
       const message = e.data;
       if (message.type === "response") {
         const pending = this.inflights.get(message.id);
-        if (pending) {
-          message.ok
-            ? pending.resolve(message.value)
-            : pending.reject(new Error(message.error.message));
+        if (pending && message.ok) {
+          pending.resolve(message.value);
+        } else if (pending && !message.ok) {
+          pending.reject(new Error(message.error.message));
         }
       }
     };
@@ -215,8 +211,8 @@ export class SyncEngine<M extends MutatorsConfig> {
 
   private async call<M extends Method>(
     method: M,
-    args: WorkerMethods[M]["args"],
-  ): Promise<WorkerMethods[M]["result"]> {
+    args: RpcMethods[M]["args"],
+  ): Promise<RpcMethods[M]["result"]> {
     return new Promise((resolve, reject) => {
       const requestId = crypto.randomUUID();
       this.inflights.set(requestId, { resolve, reject });
@@ -330,13 +326,20 @@ export class SyncEngine<M extends MutatorsConfig> {
     };
   }
 
+  async exportDb(): Promise<Uint8Array<ArrayBuffer>> {
+    const data = await this.call("export", undefined);
+    return data;
+  }
+
   async sync() {
     const request = await this.call("beginPull", undefined);
     const response = await this.puller.pull(request.server_version);
     const endVersion = response.server_version;
     await this.task(async () => {
       try {
+        console.log("Before startrebase", response);
         const mutations = await this.call("startRebase", response);
+        console.log({ mutations });
         for (const mutation of mutations) {
           await this.rawMutators[mutation.name](mutation.args);
         }
@@ -350,5 +353,9 @@ export class SyncEngine<M extends MutatorsConfig> {
 
   async untracked<T>(query: Query) {
     return this.task(() => this.sql(query));
+  }
+
+  async close() {
+    return this.call("close", undefined);
   }
 }

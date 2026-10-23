@@ -31,6 +31,9 @@ const client = await SyncEngine.create({
         params: [name],
       });
     },
+    updateName: async (db) => {
+      await db.sql({ sql: "UPDATE users SET name = upper(name)", params: [] });
+    },
   },
   migrations: [
     {
@@ -54,6 +57,7 @@ const client = await SyncEngine.create({
     },
   ],
 });
+
 await client.untracked({ sql: "DELETE FROM users", params: [] });
 await client.untracked({ sql: "DELETE FROM pending_mutations", params: [] });
 const startUsers = await client.reactiveQuery(
@@ -72,10 +76,11 @@ console.log("Start users", startUsers.data);
 await client.mutate.addUser({ name: "Gwendal" });
 console.log("Added gwendal");
 
-await client.mutate.addUser({ name: "Francia" });
+await client.mutate.addUser({ name: "Remi" });
 console.log("After mutate");
 await new Promise((r) => setTimeout(r, 1000));
 
+await client.mutate.updateName();
 const beforeSync = await client.untracked({
   sql: "SELECT * FROM users",
   params: [],
