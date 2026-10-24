@@ -12,18 +12,24 @@ describe("SqliteDb", () => {
     const response = await db.handle("query", {
       sql: "SELECT 2/2",
       params: [],
+      isReadonly: true,
     });
     expect(response).toMatchObject({ rows: [1], isReadonly: true });
   });
 
   test("only 1 connexion with commit/rollback", async ({ expect }) => {
     const db = await SqliteDB.create(":memory:", { wasm });
-    await db.handle("query", { sql: "CREATE TABLE test(v)", params: [] });
+    await db.handle("query", {
+      sql: "CREATE TABLE test(v)",
+      params: [],
+      isReadonly: false,
+    });
 
     const count = async () => {
       const { rows } = await db.handle("query", {
         sql: "SELECT COUNT(*) FROM test",
         params: [],
+        isReadonly: true,
       });
       return rows[0];
     };
@@ -32,6 +38,7 @@ describe("SqliteDb", () => {
     await db.handle("query", {
       sql: "INSERT INTO test(v) VALUES (?)",
       params: ["test_value"],
+      isReadonly: false,
     });
     const duringTx = await count();
     expect(duringTx).toBe(1);

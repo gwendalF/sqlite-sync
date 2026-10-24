@@ -11,6 +11,12 @@ export type Query = {
   params?: unknown[];
 };
 
+export type RustQuery = {
+  sql: string;
+  params: unknown[];
+  isReadonly: boolean;
+};
+
 export type RpcMethods = {
   startMutate: { args: void; result: void };
   endMutate: { args: { name: string; args: unknown }; result: void };
@@ -18,7 +24,7 @@ export type RpcMethods = {
   startRebase: { args: PullResponse; result: LocalMutations };
   endRebase: { args: number; result: void };
   query: {
-    args: Query;
+    args: RustQuery;
     result: { rows: unknown[]; isReadonly: boolean };
   };
   execMigration: {
@@ -39,11 +45,7 @@ export type RpcHandlers = {
   ) => RpcMethods[M]["result"] | Promise<RpcMethods[M]["result"]>;
 };
 
-export type RpcArgs<M extends Method> = RpcMethods[M]["args"] extends
-  | void
-  | undefined
-  ? [args?: undefined]
-  : [args: RpcMethods[M]["args"]];
+export type RpcArgs<M extends Method> = RpcMethods[M]["args"];
 
 export type SerializedError = {
   message: string;
@@ -68,18 +70,20 @@ export type WorkerResponse =
   | { type: "response"; id: string; ok: true; value: unknown }
   | { type: "response"; id: string; ok: false; error: SerializedError };
 
+export type RequestFor<M extends Method> = {
+  type: "request";
+  id: string;
+  method: M;
+  args: RpcArgs<M>;
+};
+
 export type ChannelRequest = {
-  [M in Method]: {
-    type: "request";
-    id: string;
-    method: M;
-    args: RpcMethods[M]["args"];
-  };
+  [M in Method]: RequestFor<M>;
 }[Method];
 
 export type ChannelMessage =
   | { type: "hello" }
-  | { type: "leader-up" }
+  | { type: "leader-up"; leaderId: string }
   | ChannelRequest
   | { type: "response"; id: string; ok: true; value: unknown }
   | {
@@ -88,7 +92,3 @@ export type ChannelMessage =
       ok: false;
       error: SerializedError;
     };
-
-export type UpdateMessage = {
-  tables: string[];
-};

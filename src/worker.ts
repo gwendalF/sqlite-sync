@@ -42,7 +42,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   const { id, method, args } = event.data;
   try {
     if (method === "export") {
-      const result = await sqlDb.handle(method);
+      const result = await sqlDb.handle(method, undefined);
       postBytes(id, result);
       return;
     }

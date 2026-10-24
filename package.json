@@ -17,7 +17,8 @@
     "test": "vitest",
     "dev": "vite",
     "build-wasm": "wasm-pack build ./rust --target web --out-dir ../src/sync_sqlite --out-name sync_sqlite && pnpm vitest --clearCache",
-    "build": "pnpm build-wasm && tsc -p ./tsconfig.build.json && cp -r src/sync_sqlite dist/ && rm dist/sync_sqlite/.gitignore"
+    "build": "pnpm build-wasm && tsc -p ./tsconfig.build.json && cp -r src/sync_sqlite dist/ && rm dist/sync_sqlite/.gitignore",
+    "test:browser": "vitest --config=vitest.browser.config.ts"
   },
   "keywords": [],
   "author": "",
@@ -32,6 +33,7 @@
   "type": "module",
   "devDependencies": {
     "@types/node": "^26.6.4",
+    "@vitest/browser-playwright": "^5.0.5",
     "typescript": "^7.0.2",
     "vite": "^8.3.5",
     "vite-plugin-wasm": "^3.6.0",

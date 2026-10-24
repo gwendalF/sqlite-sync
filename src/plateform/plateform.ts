@@ -1,9 +1,9 @@
-import { Method, RpcArgs, RpcMethods } from "./messages";
+import { Method, RpcArgs, RpcMethods } from "../messages";
 
-export interface System {
+export interface Plateform {
   call<K extends Method>(
     method: K,
-    ...args: RpcArgs<K>
+    args: RpcArgs<K>,
   ): Promise<RpcMethods[K]["result"]>;
 
   /** Mutal exclusion between ALL tabs (navigator.locks in prod). */

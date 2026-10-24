@@ -82,6 +82,7 @@ macro_rules! console_log {
 pub struct SqlQuery {
     pub sql: String,
     pub params: Vec<serde_json::Value>,
+    pub is_readonly: bool,
 }
 
 #[wasm_bindgen]
@@ -243,6 +244,10 @@ impl SqliteEngine {
         let query: SqlQuery = serde_wasm_bindgen::from_value(query.into())?;
         let mut stmt = self.connection.prepare_cached(&query.sql)?;
         let is_readonly = stmt.readonly();
+        if query.is_readonly && !is_readonly {
+            return Err(WasmError::Other(String::from("operation is not read only")));
+        }
+
         let cols: Vec<_> = stmt.column_names().iter().map(|&c| c.to_string()).collect();
 
         let rows: Vec<_> = stmt

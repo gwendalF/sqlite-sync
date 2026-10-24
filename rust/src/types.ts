@@ -1,6 +1,7 @@
 type SqlQuery = {
   sql: string;
   params: unknown[];
+  is_readonly: boolean;
 };
 
 type SqlResult<T = Record<string, unknown>> = {
