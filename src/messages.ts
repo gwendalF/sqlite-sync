@@ -18,9 +18,9 @@ export type RustQuery = {
 };
 
 export type RpcMethods = {
-  startMutate: { args: void; result: void };
+  startMutate: { args: undefined; result: void };
   endMutate: { args: { name: string; args: unknown }; result: void };
-  beginPull: { args: void; result: PullRequest };
+  beginPull: { args: undefined; result: PullRequest };
   startRebase: { args: PullResponse; result: LocalMutations };
   endRebase: { args: number; result: void };
   query: {
@@ -31,11 +31,15 @@ export type RpcMethods = {
     args: { userVersion: number; batch: string };
     result: void;
   };
-  begin: { args: void; result: void };
-  commit: { args: void; result: void };
-  rollback: { args: void; result: void };
-  export: { args: void; result: Uint8Array<ArrayBuffer> };
-  close: { args: void; result: void };
+  cancelPull: {
+    args: undefined;
+    result: void;
+  };
+  begin: { args: undefined; result: void };
+  commit: { args: undefined; result: void };
+  rollback: { args: undefined; result: void };
+  export: { args: undefined; result: Uint8Array<ArrayBuffer> };
+  close: { args: undefined; result: void };
 };
 export type Method = keyof RpcMethods;
 

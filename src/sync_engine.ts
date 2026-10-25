@@ -8,7 +8,7 @@ import {
   Puller,
   Query,
 } from "./config";
-import { Method, RpcArgs, RustQuery } from "./messages";
+import { Method, RpcArgs } from "./messages";
 import { Plateform } from "./plateform/plateform";
 
 export type ReactiveHandlers<T> = {
@@ -154,7 +154,14 @@ export class SyncEngine<M extends MutatorsConfig> {
 
   async sync() {
     const request = await this.call("beginPull", undefined);
-    const response = await this.puller.pull(request.server_version);
+
+    const response = await this.puller
+      .pull(request.server_version)
+      .catch(async (e) => {
+        await this.call("cancelPull", undefined);
+        throw e;
+      });
+
     const endVersion = response.server_version;
 
     await this.plateform.lock(async () => {
@@ -166,6 +173,11 @@ export class SyncEngine<M extends MutatorsConfig> {
       await this.call("endRebase", endVersion);
       this.notify([...updated.keys()]);
     });
+  }
+
+  async exportDatabase(): Promise<Uint8Array<ArrayBuffer>> {
+    const data = await this.call("export", undefined);
+    return data;
   }
 
   close() {

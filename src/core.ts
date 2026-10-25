@@ -13,6 +13,7 @@ const makeHandlers = (engine: SqliteEngine): RpcHandlers => ({
   endMutate: ({ name, args: payload }) =>
     engine.end_mutate(name, JSON.stringify(payload)),
   beginPull: () => engine.begin_pull(),
+  cancelPull: () => engine.cancel_pull(),
   endRebase: (version: number) => engine.end_rebasing(version),
   startRebase: (response: PullResponse) => engine.start_rebasing(response),
   query: (query: RustQuery) => {

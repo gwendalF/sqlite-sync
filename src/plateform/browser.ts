@@ -1,6 +1,5 @@
 import type {
   ChannelMessage,
-  ChannelRequest,
   Method,
   RpcArgs,
   RpcMethods,

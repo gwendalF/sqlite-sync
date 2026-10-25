@@ -341,6 +341,15 @@ impl SqliteEngine {
     }
 
     #[wasm_bindgen]
+    pub fn cancel_pull(&mut self) -> Result<()> {
+        if !matches!(self.pull_state, PullState::Awaiting) {
+            return Err(WasmError::Other(String::from("no pull in progress")));
+        }
+        self.pull_state = PullState::Idle;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
     pub fn start_rebasing(&mut self, response: JsPullResponse) -> Result<JsLocalMutations> {
         let response: PullResponse = serde_wasm_bindgen::from_value(response.into())?;
         self.pull_state = PullState::Idle;
