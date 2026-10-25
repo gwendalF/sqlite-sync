@@ -14,7 +14,8 @@
     "dist"
   ],
   "scripts": {
-    "test": "vitest",
+    "test": "vitest -p unit",
+    "test-all": "vitest",
     "dev": "vite",
     "build-wasm": "wasm-pack build ./rust --target web --out-dir ../src/sync_sqlite --out-name sync_sqlite && pnpm vitest --clearCache",
     "build": "pnpm build-wasm && tsc -p ./tsconfig.build.json && cp -r src/sync_sqlite dist/ && rm dist/sync_sqlite/.gitignore",

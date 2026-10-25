@@ -1,5 +1,5 @@
 import { describe, test as baseTest, vi } from "vitest";
-import { SyncEngine } from "./sync_engine";
+import { sql, SyncEngine } from "./sync_engine";
 import { Puller } from "./puller";
 import { PullResponse } from "./sync_sqlite/sync_sqlite";
 import {
@@ -13,7 +13,7 @@ import { Plateform } from "./plateform/plateform";
 import { createTestHub } from "./testing.test";
 import { SqliteDB } from "./core";
 
-const test = baseTest.extend("hub", async () => {
+const it = baseTest.extend("hub", async () => {
   return createTestHub();
 });
 
@@ -37,40 +37,10 @@ async function getUserVersion(core: SqliteDB): Promise<number> {
 
 type testMut = { addUser: MutatorFn<string> };
 
-function buildEngine(plateform: Plateform): Promise<SyncEngine<testMut>>;
-function buildEngine(
+function buildEngine<M extends MutatorsConfig = testMut>(
   plateform: Plateform,
-  mutators: undefined,
-  opts?: Partial<Config<testMut>>,
-): Promise<SyncEngine<testMut>>;
-function buildEngine<M extends MutatorsConfig>(
-  Plateform: Plateform,
-  mutators: M,
   opts?: Partial<Config<M>>,
-): Promise<SyncEngine<M>>;
-function buildEngine<M extends MutatorsConfig>(
-  plateform: Plateform,
-  mutators?: M,
-  opts?: Partial<Config<M>>,
-) {
-  if (mutators) {
-    return SyncEngine.create(plateform, {
-      mutators,
-      puller: stubPuller,
-      migrations: [
-        {
-          version: 1,
-          run: async (db) => {
-            await db.exec(
-              "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)",
-            );
-          },
-        },
-      ],
-      ...opts,
-    });
-  }
-
+): Promise<SyncEngine<M>> {
   return SyncEngine.create(plateform, {
     mutators: {
       addUser: async (handle, name: string) => {
@@ -92,11 +62,11 @@ function buildEngine<M extends MutatorsConfig>(
       },
     ],
     ...opts,
-  });
+  } as Config<M>);
 }
 
-describe("SyncEngine", () => {
-  test("create a syncEngine", async ({ expect, hub }) => {
+describe("SyncEngine creation", () => {
+  it("create a syncEngine", async ({ expect, hub }) => {
     await expect(
       SyncEngine.create(hub.newTab(), {
         puller: stubPuller,
@@ -105,12 +75,12 @@ describe("SyncEngine", () => {
     ).resolves.toBeDefined();
   });
 
-  test("mutator function are callable", async ({ expect, hub }) => {
+  it("mutator function are callable", async ({ expect, hub }) => {
     const engine = await buildEngine(hub.newTab());
     await expect(engine.mutate.addUser("John Doe")).resolves.toBeUndefined();
   });
 
-  test("apply 1 migration on create", async ({ expect, hub }) => {
+  it("apply 1 migration on create", async ({ expect, hub }) => {
     const engine = await SyncEngine.create(hub.newTab(), {
       puller: stubPuller,
       mutators: {},
@@ -129,14 +99,14 @@ describe("SyncEngine", () => {
     ).resolves.toBeDefined();
   });
 
-  test("user_version is not updated after failed migration", async ({
+  it("user_version is not updated after failed migration", async ({
     expect,
     hub,
   }) => {
     const initial = await getUserVersion(hub.core);
 
     await expect(
-      buildEngine(hub.newTab(), undefined, {
+      buildEngine(hub.newTab(), {
         migrations: [
           {
             version: 1,
@@ -152,7 +122,7 @@ describe("SyncEngine", () => {
     expect(final).toEqual(initial);
   });
 
-  test("user_version is updated after successful migration", async ({
+  it("user_version is updated after successful migration", async ({
     expect,
     hub,
   }) => {
@@ -163,7 +133,7 @@ describe("SyncEngine", () => {
     expect(final).toBeGreaterThan(initial);
   });
 
-  test("mutators are queued", async ({ expect, hub }) => {
+  it("mutators are queued", async ({ expect, hub }) => {
     const order: string[] = [];
 
     let release!: () => void;
@@ -172,18 +142,20 @@ describe("SyncEngine", () => {
     const slowStarted = new Promise<void>((r) => (signalStarted = r));
 
     const engine = await buildEngine(hub.newTab(), {
-      slowMutator: async () => {
-        order.push("slow:start");
-        signalStarted();
-        await gate;
-        order.push("slow:end");
-      },
-      addUser: async (h, name: string) => {
-        order.push("add:start");
-        await h.sql({
-          sql: "INSERT INTO users(name) VALUES (?)",
-          params: [name],
-        });
+      mutators: {
+        slowMutator: async () => {
+          order.push("slow:start");
+          signalStarted();
+          await gate;
+          order.push("slow:end");
+        },
+        addUser: async (h: DBHandle, name: string) => {
+          order.push("add:start");
+          await h.sql({
+            sql: "INSERT INTO users(name) VALUES (?)",
+            params: [name],
+          });
+        },
       },
     });
 
@@ -203,21 +175,23 @@ describe("SyncEngine", () => {
     ).toMatchObject([{ id: 1, name: "John Doe" }]);
   });
 
-  test("rejection on mutator does not block queued mutators", async ({
+  it("rejection on mutator does not block queued mutators", async ({
     expect,
     hub,
   }) => {
     const engine = await buildEngine(hub.newTab(), {
-      throw: async (h) => {
-        return new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("invalid mutator")), 0),
-        );
-      },
-      valid: async (h) => {
-        await h.sql({
-          sql: "INSERT INTO users(name) VALUES (?),(?)",
-          params: ["John Doe", "Jane Doe"],
-        });
+      mutators: {
+        throw: async (h: DBHandle) => {
+          return new Promise<void>((_, reject) =>
+            setTimeout(() => reject(new Error("invalid mutator")), 0),
+          );
+        },
+        valid: async (h: DBHandle) => {
+          await h.sql({
+            sql: "INSERT INTO users(name) VALUES (?),(?)",
+            params: ["John Doe", "Jane Doe"],
+          });
+        },
       },
     });
 
@@ -233,15 +207,17 @@ describe("SyncEngine", () => {
     ).toBe(2);
   });
 
-  test("mutator are atomic", async ({ expect, hub }) => {
+  it("mutator are atomic", async ({ expect, hub }) => {
     const engine = await buildEngine(hub.newTab(), {
-      atomicMutator: async (h) => {
-        await h.sql({
-          sql: "INSERT INTO users(name) VALUES (?)",
-          params: ["John"],
-        });
+      mutators: {
+        atomicMutator: async (h: DBHandle) => {
+          await h.sql({
+            sql: "INSERT INTO users(name) VALUES (?)",
+            params: ["John"],
+          });
 
-        throw new Error("error after insert");
+          throw new Error("error after insert");
+        },
       },
     });
 
@@ -255,8 +231,8 @@ describe("SyncEngine", () => {
   });
 });
 
-describe("multiple tabs", () => {
-  test("migrations are run only once", async ({ expect, hub }) => {
+describe("handle multiple tabs", () => {
+  it("migrations are run only once", async ({ expect, hub }) => {
     const tabA = hub.newTab();
     const tabB = hub.newTab();
 
@@ -276,8 +252,8 @@ describe("multiple tabs", () => {
       ],
     };
 
-    const engineA = buildEngine(tabA, undefined, opts);
-    const eningeB = buildEngine(tabB, undefined, opts);
+    const engineA = buildEngine(tabA, opts);
+    const eningeB = buildEngine(tabB, opts);
     await Promise.all([engineA, eningeB]);
 
     expect(called).toBe(1);
@@ -290,7 +266,7 @@ describe("multiple tabs", () => {
     expect(count).toBe(1);
   });
 
-  test("tabA notify tabB on insert", async ({ expect, hub }) => {
+  it("tabA notify tabB on insert", async ({ expect, hub }) => {
     const engineA = await buildEngine(hub.newTab());
     const tabB = hub.newTab();
 
@@ -304,16 +280,18 @@ describe("multiple tabs", () => {
     expect(onChange).toHaveBeenCalled();
   });
 
-  test("tabA notify tabB on update", async ({ expect, hub }) => {
+  it("tabA notify tabB on update", async ({ expect, hub }) => {
     const engineA = await buildEngine(hub.newTab(), {
-      addUser: async (h: DBHandle, name: string) => {
-        await h.sql({
-          sql: "INSERT INTO users(name) VALUES (?)",
-          params: [name],
-        });
-      },
-      upperCase: async (h: DBHandle) => {
-        await h.sql({ sql: "UPDATE users SET name = upper(name)" });
+      mutators: {
+        addUser: async (h: DBHandle, name: string) => {
+          await h.sql({
+            sql: "INSERT INTO users(name) VALUES (?)",
+            params: [name],
+          });
+        },
+        upperCase: async (h: DBHandle) => {
+          await h.sql({ sql: "UPDATE users SET name = upper(name)" });
+        },
       },
     });
     const tabB = hub.newTab();
@@ -330,7 +308,7 @@ describe("multiple tabs", () => {
     expect(onChange).toHaveBeenCalled();
   });
 
-  test("tabA notify tabB with only 'users' table when adding user", async ({
+  it("tabA notify tabB with only 'users' table when adding user", async ({
     expect,
     hub,
   }) => {
@@ -347,8 +325,8 @@ describe("multiple tabs", () => {
   });
 });
 
-describe("reactive query", () => {
-  test("query is notified when table change", async ({ expect, hub }) => {
+describe("have reactive query", () => {
+  it("query is notified when table change", async ({ expect, hub }) => {
     const engine = await buildEngine(hub.newTab());
 
     const onChange = vi.fn();
@@ -370,7 +348,7 @@ describe("reactive query", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  test.for([
+  it.for([
     ["CREATE TABLE tests(c)"],
     ["INSERT INTO users(name) VALUES ('Test')"],
     ["UPDATE users SET name = upper(name)"],
@@ -380,5 +358,170 @@ describe("reactive query", () => {
     await expect(
       engine.reactiveQuery({ sql }, { onChange: vi.fn() }),
     ).rejects.toThrow("read only");
+  });
+});
+
+describe("SyncEngine allow to sync", () => {
+  it("adds data from the server", async ({ expect, hub }) => {
+    const puller = {
+      pull: vi.fn<Puller["pull"]>().mockResolvedValue({
+        server_version: 1,
+        last_mutation_id: 0,
+        mutations: [
+          {
+            op: "upsert",
+            table: "users",
+            pks: ["id"],
+            records: [
+              { id: 1, name: "John Doe" },
+              { id: 2, name: "Jane Doe" },
+            ],
+          },
+        ],
+      }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), { puller });
+    await engine.sync();
+
+    const {
+      rows: [count],
+    } = await engine.sql<number>(sql`SELECT COUNT(*) FROM users`);
+    expect(count).toBe(2);
+  });
+
+  it("deletes data when server says so", async ({ expect, hub }) => {
+    const puller = {
+      pull: vi.fn<Puller["pull"]>().mockResolvedValue({
+        server_version: 1,
+        last_mutation_id: 0,
+        mutations: [
+          {
+            op: "delete",
+            table: "users",
+            pks: ["id"],
+            records: [{ id: 1 }, { id: 2 }],
+          },
+        ],
+      }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), { puller });
+    await engine.sql(
+      sql`INSERT INTO users(id, name) VALUES (${1}, 'Jane'), (2, ${"John"}), (3, 'Not deleted')`,
+      false,
+    );
+
+    await engine.sync();
+    const { rows } = await engine.sql(sql`SELECT * FROM users`);
+    expect(rows).toMatchObject([{ id: 3, name: "Not deleted" }]);
+  });
+
+  it("deletes table with multiple columns primary key", async ({
+    expect,
+    hub,
+  }) => {
+    const puller = {
+      pull: vi.fn<Puller["pull"]>().mockResolvedValue({
+        server_version: 1,
+        last_mutation_id: 0,
+        mutations: [
+          {
+            op: "delete",
+            table: "users",
+            pks: ["name", "age"],
+            records: [
+              { name: "John", age: 20 },
+              { name: "Me", age: 32 },
+            ],
+          },
+        ],
+      }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), {
+      puller,
+      migrations: [
+        {
+          version: 1,
+          run: async (db: MigrationHandle) => {
+            await db.exec(
+              "CREATE TABLE users (name,age,friend, PRIMARY KEY (name,age))",
+            );
+          },
+        },
+      ],
+    });
+    await engine.sql(
+      sql`INSERT INTO users(name,age) VALUES ('Jane', 20), (${"John"}, ${20}), ('Me', 32)`,
+      false,
+    );
+
+    await engine.sync();
+    const { rows } = await engine.sql(sql`SELECT * FROM users`);
+    expect(rows).toMatchObject([{ name: "Jane", age: 20 }]);
+  });
+
+  it("replays mutations on server state", async ({ expect, hub }) => {
+    const puller = {
+      pull: vi.fn<Puller["pull"]>().mockResolvedValue({
+        server_version: 1,
+        last_mutation_id: 0,
+        mutations: [
+          {
+            op: "upsert",
+            table: "users",
+            pks: ["id"],
+            records: [
+              { id: 1, name: "John" },
+              { id: 2, name: "Me" },
+            ],
+          },
+        ],
+      }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), {
+      puller,
+      mutators: {
+        upperName: async (handle: DBHandle) => {
+          handle.sql(sql`UPDATE users SET name = upper(name)`);
+        },
+      },
+    });
+
+    await engine.mutate.upperName(); // does nothing since no users
+    const { rows } = await engine.sql(sql`SELECT * FROM users ORDER BY id`);
+    expect(rows.length).toBe(0); // no users yet
+
+    await engine.sync();
+    const afterSync = await engine.sql(sql`SELECT * FROM users ORDER BY id`);
+    expect(afterSync.rows).toMatchObject([
+      { id: 1, name: "JOHN" },
+      { id: 2, name: "ME" },
+    ]); // mutation applied
+  });
+});
+
+describe("sql function", () => {
+  it.for([
+    {
+      query: () => sql`SELECT * FROM users WHERE name = ${"Jane"}`,
+      params: ["Jane"],
+      sql: "SELECT * FROM users WHERE name = ?",
+    },
+    {
+      query: () => sql`INSERT INTO users (name, age) VALUES (${"John"}, ${30})`,
+      params: ["John", 30],
+      sql: "INSERT INTO users (name, age) VALUES (?, ?)",
+    },
+    {
+      query: () =>
+        sql`WITH adults AS (SELECT * FROM users WHERE age >= ${18}) SELECT name FROM adults`,
+      params: [18],
+      sql: "WITH adults AS (SELECT * FROM users WHERE age >= ?) SELECT name FROM adults",
+    },
+  ])("sql for %j", ({ query, params, sql }, { expect }) => {
+    expect(query()).toMatchObject({ sql, params });
   });
 });

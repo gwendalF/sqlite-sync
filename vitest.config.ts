@@ -5,6 +5,7 @@ import wasm from "vite-plugin-wasm";
 export default defineConfig({
   plugins: [wasm()],
   test: {
+    restoreMocks: true,
     projects: [
       {
         test: {

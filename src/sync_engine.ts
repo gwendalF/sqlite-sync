@@ -5,9 +5,10 @@ import {
   MigrationHandle,
   MutatorsConfig,
   PublicMutators,
+  Puller,
   Query,
 } from "./config";
-import { Method, RpcArgs } from "./messages";
+import { Method, RpcArgs, RustQuery } from "./messages";
 import { Plateform } from "./plateform/plateform";
 
 export type ReactiveHandlers<T> = {
@@ -17,10 +18,31 @@ export type ReactiveHandlers<T> = {
 
 type Listener = { tables: Set<string>; onChange(): void };
 
+export function sql(
+  strings: TemplateStringsArray,
+  ...params: unknown[]
+): Query {
+  let query = "";
+  for (let i = 0; i < params.length; i++) {
+    query += strings[i] + "?";
+  }
+
+  query += strings[strings.length - 1];
+  return {
+    sql: query,
+    params,
+  };
+}
+
 export class SyncEngine<M extends MutatorsConfig> {
   private tablesCache = new Map<string, string[]>();
   private listeners = new Set<Listener>();
+  private puller: Puller;
 
+  private rawMutators: Record<
+    string,
+    (tables: Set<string>, payload: unknown) => Promise<void>
+  >;
   mutate: PublicMutators<M>;
 
   private constructor(
@@ -29,15 +51,21 @@ export class SyncEngine<M extends MutatorsConfig> {
   ) {
     const publicMutators: Record<string, (payload: unknown) => Promise<void>> =
       {};
+    const rawMutators: Record<
+      string,
+      (tables: Set<string>, payload: unknown) => Promise<void>
+    > = {};
+
+    this.puller = config.puller;
 
     for (const [name, fn] of Object.entries(config.mutators)) {
       publicMutators[name] = async (payload) => {
         await this.plateform.lock(async () => {
           const written = new Set<string>();
           try {
-            await this.call("begin", undefined);
+            await this.call("startMutate", undefined);
             await fn(this.trackingHandle(written), payload);
-            await this.call("commit", undefined);
+            await this.call("endMutate", { args: payload, name });
             const tables = [...written.keys()];
             this.notify(tables);
           } catch (e) {
@@ -46,9 +74,14 @@ export class SyncEngine<M extends MutatorsConfig> {
           }
         });
       };
+
+      rawMutators[name] = async (tables, payload) => {
+        await fn(this.trackingHandle(tables), payload);
+      };
     }
 
     this.mutate = publicMutators as PublicMutators<M>;
+    this.rawMutators = rawMutators;
   }
 
   static async create<M extends MutatorsConfig>(
@@ -117,6 +150,22 @@ export class SyncEngine<M extends MutatorsConfig> {
         this.listeners.delete(listener);
       },
     };
+  }
+
+  async sync() {
+    const request = await this.call("beginPull", undefined);
+    const response = await this.puller.pull(request.server_version);
+    const endVersion = response.server_version;
+
+    await this.plateform.lock(async () => {
+      const mutations = await this.call("startRebase", response);
+      const updated = new Set<string>();
+      for (const mutation of mutations) {
+        await this.rawMutators[mutation.name](updated, mutation.args);
+      }
+      await this.call("endRebase", endVersion);
+      this.notify([...updated.keys()]);
+    });
   }
 
   close() {

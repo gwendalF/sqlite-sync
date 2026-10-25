@@ -72,9 +72,8 @@ extern "C" {
     fn log(s: &str);
 }
 
+#[allow(unused_macros)]
 macro_rules! console_log {
-    // Note that this is using the `log` function imported above during
-    // `bare_bones`
     ($($t:tt)*) => (log(&format_args!($($t)*).to_string()))
 }
 
@@ -535,7 +534,21 @@ impl SqliteEngine {
                         ))?;
                     }
                 }
-                MutationOp::Delete => todo!("Not done yet"),
+                MutationOp::Delete => {
+                    let mut pks = mutation.pks;
+                    for record in mutation.records {
+                        sql_string.clear();
+                        Self::write_delete(&mut sql_string, &mutation.table, &mut pks);
+
+                        let mut stmt = self.connection.prepare_cached(&sql_string)?;
+                        stmt.execute(rusqlite::params_from_iter(
+                            record
+                                .into_iter()
+                                .filter(|(k, _)| pks.contains(k))
+                                .map(|(_, v)| Self::to_rusqlite(v)),
+                        ))?;
+                    }
+                }
             }
         }
 
@@ -597,6 +610,39 @@ impl SqliteEngine {
         }
         if first {
             sql.push_str(" DO NOTHING");
+        }
+    }
+
+    fn write_delete(sql: &mut String, table: &str, pks: &mut [String]) {
+        sql.push_str("DELETE FROM ");
+        Self::push_ident(sql, table);
+        pks.sort();
+        sql.push_str(" WHERE ");
+        if pks.len() == 1 {
+            Self::push_ident(sql, &pks[0]);
+        } else {
+            sql.push('(');
+            pks.iter().enumerate().for_each(|(i, key)| {
+                Self::push_ident(sql, key);
+                if i != pks.len() - 1 {
+                    sql.push_str(", ");
+                }
+            });
+            sql.push(')');
+        }
+
+        sql.push_str(" = ");
+        if pks.len() == 1 {
+            sql.push('?');
+        } else {
+            sql.push('(');
+            pks.iter().enumerate().for_each(|(i, _)| {
+                sql.push('?');
+                if i != pks.len() - 1 {
+                    sql.push_str(", ");
+                }
+            });
+            sql.push(')');
         }
     }
 }
