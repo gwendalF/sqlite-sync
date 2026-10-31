@@ -8,8 +8,8 @@ import {
   Puller,
   Query,
 } from "./config";
-import { Method, RpcArgs } from "./messages";
-import { Plateform } from "./plateform/plateform";
+import { Method, RpcArgs } from "./messages.ts";
+import { Plateform } from "./plateform/plateform.ts";
 
 export type ReactiveHandlers<T> = {
   onChange: (data: T[]) => void;
@@ -213,8 +213,8 @@ export class SyncEngine<M extends MutatorsConfig> {
     };
   }
 
-  private async call<M extends Method>(method: M, args: RpcArgs<M>) {
-    return this.plateform.call(method, args);
+  private async call<M extends Method>(method: M, ...args: [...RpcArgs<M>]) {
+    return this.plateform.call(method, ...args);
   }
 
   private async applyMigrations(migrations: Migration[]) {

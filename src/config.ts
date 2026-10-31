@@ -1,5 +1,5 @@
-import { Query } from "./messages";
-import { Puller } from "./puller";
+import { Query } from "./messages.ts";
+import { Puller } from "./puller.ts";
 
 export type DBHandle = {
   sql: (query: Query) => Promise<unknown[]>;

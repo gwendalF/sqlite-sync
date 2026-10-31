@@ -4,7 +4,7 @@ import type { Plateform } from "./plateform";
 
 const uid = () => crypto.randomUUID();
 const worker = () => {
-  const w = new Worker(new URL("../worker.ts", import.meta.url), {
+  const w = new Worker(new URL("../worker.js", import.meta.url), {
     type: "module",
   });
   return w;

@@ -1,12 +1,11 @@
 import {
   Method,
-  Query,
   RpcArgs,
   RpcHandlers,
   RpcMethods,
   RustQuery,
 } from "./messages";
-import init, { PullResponse, SqliteEngine } from "./sync_sqlite/sync_sqlite";
+import init, { PullResponse, SqliteEngine } from "./sync_sqlite/sync_sqlite.js";
 
 const makeHandlers = (engine: SqliteEngine): RpcHandlers => ({
   startMutate: () => engine.start_mutate(),
@@ -57,8 +56,8 @@ export class SqliteDB {
 
   async handle<M extends Method>(
     method: M,
-    args: RpcArgs<M>,
+    ...args: RpcArgs<M>
   ): Promise<RpcMethods[M]["result"]> {
-    return this.handlers[method](args);
+    return this.handlers[method](args[0]);
   }
 }

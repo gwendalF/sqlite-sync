@@ -1,4 +1,4 @@
-export { SyncEngine, sql } from "./sync_engine";
+export { SyncEngine, sql } from "./sync_engine.ts";
 export type {
   Config,
   PublicMutators,
@@ -8,11 +8,11 @@ export type {
   DBHandle,
   Migration,
   Query,
-} from "./config";
+} from "./config.ts";
 
 export {
   BrowserPlateform,
   type BrowserPlateformOptions,
-} from "./plateform/browser";
-export { Plateform } from "./plateform/plateform";
-export type { PullResponse } from "./sync_sqlite/sync_sqlite";
+} from "./plateform/browser.ts";
+export type { Plateform } from "./plateform/plateform.ts";
+export type { PullResponse } from "./sync_sqlite/sync_sqlite.js";

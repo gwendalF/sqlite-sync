@@ -181,7 +181,7 @@ export class BrowserPlateform implements Plateform {
 
   async call<M extends Method>(
     method: M,
-    args: RpcArgs<M>,
+    ...args: RpcArgs<M>
   ): Promise<RpcMethods[M]["result"]> {
     return new Promise((resolve, reject) => {
       const id = crypto.randomUUID();
@@ -189,7 +189,7 @@ export class BrowserPlateform implements Plateform {
         type: "request",
         id,
         method,
-        args,
+        args: args[0],
       };
       this.inflights.set(id, { message, resolve, reject });
       this.sendRpc(message);

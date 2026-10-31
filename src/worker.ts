@@ -1,5 +1,5 @@
-import { SqliteDB } from "./core";
-import { WorkerRequest, WorkerResponse } from "./messages";
+import { SqliteDB } from "./core.ts";
+import { WorkerRequest, WorkerResponse } from "./messages.ts";
 
 let sqlDb: SqliteDB | undefined;
 const post = (m: WorkerResponse) => self.postMessage(m);
@@ -42,7 +42,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   const { id, method, args } = event.data;
   try {
     if (method === "export") {
-      const result = await sqlDb.handle(method, undefined);
+      const result = await sqlDb.handle(method);
       postBytes(id, result);
       return;
     }

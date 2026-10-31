@@ -2,7 +2,7 @@ import type {
   LocalMutations,
   PullRequest,
   PullResponse,
-} from "./sync_sqlite/sync_sqlite";
+} from "./sync_sqlite/sync_sqlite.js";
 
 export type ErrorCode = "INITIALISATION_NOT_DONE" | "RUNTIME_ERROR";
 
@@ -49,7 +49,11 @@ export type RpcHandlers = {
   ) => RpcMethods[M]["result"] | Promise<RpcMethods[M]["result"]>;
 };
 
-export type RpcArgs<M extends Method> = RpcMethods[M]["args"];
+export type RpcArgs<M extends Method> = RpcMethods[M]["args"] extends
+  | void
+  | undefined
+  ? [args?: undefined]
+  : [RpcMethods[M]["args"]];
 
 export type SerializedError = {
   message: string;
@@ -78,7 +82,7 @@ export type RequestFor<M extends Method> = {
   type: "request";
   id: string;
   method: M;
-  args: RpcArgs<M>;
+  args: RpcMethods[M]["args"];
 };
 
 export type ChannelRequest = {
