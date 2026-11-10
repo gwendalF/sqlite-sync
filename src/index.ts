@@ -4,15 +4,23 @@ export type {
   PublicMutators,
   MutatorFn,
   MutatorsConfig,
-  Puller,
+  Syncer,
   DBHandle,
   Migration,
   Query,
+  ValidatedConfig,
 } from "./config.ts";
+
+export { defineMutators } from "./config.ts";
 
 export {
   BrowserPlateform,
   type BrowserPlateformOptions,
 } from "./plateform/browser.ts";
+
 export type { Plateform } from "./plateform/plateform.ts";
-export type { PullResponse } from "./sync_sqlite/sync_sqlite.js";
+export type {
+  PullResponse,
+  PushRequest,
+  PullRequest,
+} from "./sync_sqlite/sync_sqlite.js";

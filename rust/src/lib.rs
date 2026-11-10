@@ -2,12 +2,12 @@ use std::{collections::BTreeMap, pin::Pin, ptr::NonNull};
 
 use rusqlite::{
     params,
-    session::{invert_strm, Session},
+    session::{invert_strm, ConflictAction, ConflictType, Session},
     types::ValueRef,
 };
 use serde::{Deserialize, Serialize};
-use sqlite_wasm_rs::WasmOsCallback;
-use sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg;
+use sqlite_wasm_rs::{vfs::VfsFilesManager, WasmOsCallback};
+use sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfgBuilder;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 use crate::WasmError::Sql;
@@ -21,7 +21,7 @@ pub enum WasmError {
 impl From<WasmError> for wasm_bindgen::JsValue {
     fn from(value: WasmError) -> Self {
         match value {
-            WasmError::Sql(r) => wasm_bindgen::JsValue::from_str(&r),
+            WasmError::Sql(s) => wasm_bindgen::JsValue::from_str(&s),
             WasmError::Other(s) => wasm_bindgen::JsValue::from_str(&s),
             WasmError::Serde(s) => wasm_bindgen::JsValue::from_str(&s),
         }
@@ -68,6 +68,9 @@ extern "C" {
     #[wasm_bindgen(typescript_type = "LocalMutations")]
     pub type JsLocalMutations;
 
+    #[wasm_bindgen(typescript_type = "PushRequest")]
+    pub type JsPushRequest;
+
     #[wasm_bindgen(js_namespace = console)]
     fn log(s: &str);
 }
@@ -77,7 +80,7 @@ macro_rules! console_log {
     ($($t:tt)*) => (log(&format_args!($($t)*).to_string()))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct SqlQuery {
     pub sql: String,
     pub params: Vec<serde_json::Value>,
@@ -88,6 +91,7 @@ pub struct SqlQuery {
 pub struct SqliteEngine {
     client_id: String,
     connection: Pin<Box<rusqlite::Connection>>,
+    pool: Option<sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil>,
     server_version: usize,
     pull_state: PullState,
     push_state: PushState,
@@ -102,7 +106,7 @@ pub struct SqlOutput {
 #[derive(Serialize)]
 pub struct PullRequest {
     client_id: String,
-    server_version: usize,
+    known_version: usize,
 }
 
 #[derive(Deserialize)]
@@ -114,8 +118,15 @@ pub struct PullResponse {
 
 #[derive(Serialize)]
 pub struct LocalMutation {
+    id: usize,
     name: String,
     args: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub struct PushRequest {
+    client_id: String,
+    mutations: Vec<LocalMutation>,
 }
 
 #[derive(Deserialize)]
@@ -133,7 +144,7 @@ pub struct TableMutation {
     records: Vec<BTreeMap<String, serde_json::Value>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Mutation {
     id: usize,
     name: String,
@@ -173,10 +184,13 @@ impl<'a> From<RollbackErr<'a>> for WasmError {
 impl SqliteEngine {
     #[wasm_bindgen]
     pub async fn create(db_path: &str) -> Result<Self> {
-        if !db_path.contains(":memory:") {
-            sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(&OpfsSAHPoolCfg::default(), true)
-                .await?;
-        }
+        let pool = if !db_path.contains(":memory:") {
+            let cfg = OpfsSAHPoolCfgBuilder::new().initial_capacity(12).build();
+            let pool = sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(&cfg, true).await?;
+            Some(pool)
+        } else {
+            None
+        };
 
         let conn = rusqlite::Connection::open(db_path)?;
 
@@ -222,6 +236,7 @@ impl SqliteEngine {
         Ok(SqliteEngine {
             client_id,
             connection: Box::pin(conn),
+            pool,
             server_version: id as usize,
             pull_state: PullState::Idle,
             push_state: PushState::Idle,
@@ -233,11 +248,6 @@ impl SqliteEngine {
         drop(self);
     }
 
-    #[wasm_bindgen(getter)]
-    pub fn client_id(&self) -> String {
-        self.client_id.clone()
-    }
-
     #[wasm_bindgen]
     pub fn sql_exec(&self, query: JsSqlQuery) -> Result<JsSqlResult> {
         let query: SqlQuery = serde_wasm_bindgen::from_value(query.into())?;
@@ -247,7 +257,7 @@ impl SqliteEngine {
             return Err(WasmError::Other(String::from("operation is not read only")));
         }
 
-        let cols: Vec<_> = stmt.column_names().iter().map(|&c| c.to_string()).collect();
+        let cols: Vec<_> = stmt.column_names().map(|c| c.to_string()).collect();
 
         let rows: Vec<_> = stmt
             .query_map(
@@ -282,6 +292,46 @@ impl SqliteEngine {
         tx.pragma_update(None, "user_version", user_version)?;
         tx.commit()?;
         Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn push_request(&self) -> Result<JsPushRequest> {
+        let mut stmt = self
+            .connection
+            .prepare_cached("SELECT id, name, json(args) FROM pending_mutations ORDER BY id")?;
+
+        let mutations = stmt
+            .query_map((), |row| {
+                let args = row.get_ref(2)?.as_str_or_null()?;
+                let value = match args {
+                    Some(args) => {
+                        let value = serde_json::from_str(args).map_err(|e| {
+                            rusqlite::Error::InvalidColumnType(
+                                1,
+                                e.to_string(),
+                                rusqlite::types::Type::Text,
+                            )
+                        })?;
+                        Some(value)
+                    }
+                    None => None,
+                };
+                Ok(LocalMutation {
+                    id: row.get::<_, i64>(0)? as usize,
+                    name: row.get(1)?,
+                    args: value,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let request = PushRequest {
+            client_id: self.client_id.clone(),
+            mutations,
+        };
+        let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+        let js_request = request.serialize(&serializer)?;
+
+        Ok(JsPushRequest { obj: js_request })
     }
 
     fn rusqlite_to_serde<'a>(
@@ -331,8 +381,8 @@ impl SqliteEngine {
 
         let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
         let request = PullRequest {
-            server_version: self.server_version,
-            client_id: self.client_id(),
+            known_version: self.server_version,
+            client_id: self.client_id.clone(),
         };
 
         let js_req = request.serialize(&serializer)?;
@@ -360,6 +410,7 @@ impl SqliteEngine {
         let mut stmt = self
             .connection
             .prepare_cached("UPDATE config SET value = ? WHERE key = 'server_version'")?;
+
         stmt.execute((response.server_version as i64,))
             .map_err(|e| RollbackErr {
                 reason: e.to_string(),
@@ -379,9 +430,23 @@ impl SqliteEngine {
                 conn: &self.connection,
             })?;
 
+        let mut stmt = self
+            .connection
+            .prepare_cached("DELETE FROM pending_mutations WHERE id <= ?")
+            .map_err(|e| RollbackErr {
+                reason: e.to_string(),
+                conn: &self.connection,
+            })?;
+        stmt.execute((response.last_mutation_id as i64,))
+            .map_err(|e| RollbackErr {
+                reason: e.to_string(),
+                conn: &self.connection,
+            })?;
+
         let response: Vec<_> = mutations
             .into_iter()
             .map(|m| LocalMutation {
+                id: m.id,
                 name: m.name,
                 args: m.args,
             })
@@ -391,6 +456,7 @@ impl SqliteEngine {
             reason: e.to_string(),
             conn: &self.connection,
         })?;
+
         Ok(response.into())
     }
 
@@ -473,9 +539,30 @@ impl SqliteEngine {
     }
 
     #[wasm_bindgen]
-    pub fn export_db(&self) -> Result<Vec<u8>> {
+    pub fn export_db(&mut self) -> Result<Vec<u8>> {
         let data = self.connection.serialize("main")?;
         Ok(data.to_vec())
+    }
+
+    #[wasm_bindgen]
+    pub fn list_databases(&self) -> Result<Vec<String>> {
+        match &self.pool {
+            None => Ok(vec![]),
+            Some(p) => Ok(p.names()?),
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn delete_databases(&self, databases: Vec<String>) -> Result<()> {
+        match &self.pool {
+            None => Err(WasmError::Other(String::from("no sah pool"))),
+            Some(p) => {
+                for name in databases {
+                    p.remove(&name)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn rever_changesets(&self, last_mutation_id: usize) -> rusqlite::Result<Vec<Mutation>> {
@@ -511,11 +598,23 @@ impl SqliteEngine {
 
         for change in &changes {
             let mut slice: &[u8] = &change.changeset;
-            self.connection
-                .apply_strm(&mut slice, Option::<fn(&str) -> bool>::None, |_, _| {
-                    rusqlite::session::ConflictAction::SQLITE_CHANGESET_ABORT
-                })?;
+            self.connection.apply_strm(
+                &mut slice,
+                Option::<fn(&str) -> bool>::None,
+                // https://sqlite.org/session.html#SQLITE_CHANGESET_ABORT
+                |conflict_type, _| match conflict_type {
+                    ConflictType::SQLITE_CHANGESET_DATA => ConflictAction::SQLITE_CHANGESET_REPLACE,
+                    ConflictType::SQLITE_CHANGESET_NOTFOUND => {
+                        ConflictAction::SQLITE_CHANGESET_OMIT
+                    }
+                    ConflictType::SQLITE_CHANGESET_CONFLICT => {
+                        ConflictAction::SQLITE_CHANGESET_REPLACE
+                    }
+                    _ => ConflictAction::SQLITE_CHANGESET_ABORT,
+                },
+            )?;
         }
+
         changes.retain(|mutation| mutation.id > last_mutation_id);
         Ok(changes)
     }

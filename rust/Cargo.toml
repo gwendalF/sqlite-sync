@@ -11,23 +11,22 @@ crate-type = ["cdylib", "rlib"]
 default = ["console_error_panic_hook"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2.84"
-sqlite-wasm-vfs = { version = "0.2.0" }
+wasm-bindgen = "0.2.130"
+sqlite-wasm-vfs = { version = "0.3.0", features = ["sahpool"] }
 
 # The `console_error_panic_hook` crate provides better debugging of panics by
 # logging them with `console.error`. This is great for development, but requires
 # all the `std::fmt` and `std::panicking` infrastructure, so isn't great for
 # code size when deploying.
 console_error_panic_hook = { version = "0.1.7", optional = true }
-wasm-bindgen-futures = "0.4.79"
-sqlite-wasm-rs = "0.5.5"
+wasm-bindgen-futures = "0.4.80"
+sqlite-wasm-rs = { version = "0.6.2", features = ["wasm-bindgen"] }
 
 [dependencies]
 itoa = "1.0.18"
-rusqlite = { version = "0.40.2", features = [
+rusqlite = { version = "0.41.1", features = [
     "bundled",
     "session",
-    "buildtime_bindgen",
     "serialize",
 ] }
 serde = { version = "1.0.229", features = ["derive"] }

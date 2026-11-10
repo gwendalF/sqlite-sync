@@ -1,7 +1,6 @@
-import { readFileSync } from "fs";
-import { SqliteDB } from "./core";
-import { Plateform } from "./plateform/plateform";
-import { test } from "vitest";
+import { readFileSync } from "node:fs";
+import { SqliteDB } from "./core.ts";
+import { Plateform } from "./plateform/plateform.ts";
 
 const wasm = await WebAssembly.compile(
   readFileSync(new URL("./sync_sqlite/sync_sqlite_bg.wasm", import.meta.url)),
@@ -20,7 +19,7 @@ export async function createTestHub(name = ":memory:") {
         try {
           return await core.handle(method, ...args);
         } catch (e) {
-          throw new Error(e instanceof Error ? e.message : String(e));
+          throw e;
         }
       },
       lock: (fn) => {
@@ -48,7 +47,7 @@ export async function createTestHub(name = ":memory:") {
           delivery.finally(() => pending.delete(delivery));
         }
       },
-      close() {},
+      async close() {},
     };
   };
 
@@ -66,5 +65,3 @@ export async function createTestHub(name = ":memory:") {
     },
   };
 }
-
-test("has test in file", () => {});

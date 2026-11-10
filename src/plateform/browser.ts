@@ -53,7 +53,7 @@ export class BrowserPlateform implements Plateform {
     this.reactive = new BroadcastChannel(this.namespaces.reactive);
   }
 
-  async start() {
+  start = async () => {
     this.release = this.claimLeaderShip(this.namespaces, this.opts.dbName);
 
     await new Promise<void>((resolve) => {
@@ -80,12 +80,12 @@ export class BrowserPlateform implements Plateform {
       );
       this.rpc.postMessage({ type: "hello" } satisfies ChannelMessage);
     });
-  }
+  };
 
-  private claimLeaderShip(
+  private claimLeaderShip = (
     namespaces: { task: string; rpc: string; leader: string },
     dbConfig: string,
-  ) {
+  ) => {
     const abort = new AbortController();
     navigator.locks
       .request(namespaces.leader, { signal: abort.signal }, async () => {
@@ -166,9 +166,9 @@ export class BrowserPlateform implements Plateform {
       });
 
     return () => abort.abort();
-  }
+  };
 
-  private replayInflights() {
+  private replayInflights = () => {
     for (const [id, { message, reject }] of this.inflights) {
       try {
         this.sendRpc(message);
@@ -177,12 +177,12 @@ export class BrowserPlateform implements Plateform {
         reject(err instanceof Error ? err : new Error(`${err}`));
       }
     }
-  }
+  };
 
-  async call<M extends Method>(
+  call = async <M extends Method>(
     method: M,
     ...args: RpcArgs<M>
-  ): Promise<RpcMethods[M]["result"]> {
+  ): Promise<RpcMethods[M]["result"]> => {
     return new Promise((resolve, reject) => {
       const id = crypto.randomUUID();
       const message: RequestFor<M> = {
@@ -194,33 +194,35 @@ export class BrowserPlateform implements Plateform {
       this.inflights.set(id, { message, resolve, reject });
       this.sendRpc(message);
     });
-  }
+  };
 
-  private sendRpc<M extends Method>(message: RequestFor<M>) {
+  private sendRpc = <M extends Method>(message: RequestFor<M>) => {
     this.rpc.postMessage(message);
-  }
+  };
 
-  lock<T>(fn: () => Promise<T>, signal?: AbortSignal) {
+  lock = <T>(fn: () => Promise<T>, signal?: AbortSignal) => {
     return navigator.locks.request(this.namespaces.task, { signal }, fn);
-  }
+  };
 
-  onTablesChanged(cb: (tables: string[] | "*") => void): () => void {
+  onTablesChanged = (cb: (tables: string[] | "*") => void): (() => void) => {
     const on = (e: MessageEvent<string[] | "*">) => cb(e.data);
 
     this.reactive.addEventListener("message", on);
     return () => {
       this.reactive.removeEventListener("message", on);
     };
-  }
+  };
 
-  notifyTablesChanged(tables: string[] | "*") {
+  notifyTablesChanged = (tables: string[] | "*") => {
     this.reactive.postMessage(tables);
-  }
+  };
 
-  close() {
+  close = async () => {
+    await this.call("close");
+
     this.release?.();
     this.reactive.close();
     this.rpc.close();
     this.worker?.terminate();
-  }
+  };
 }

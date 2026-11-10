@@ -5,8 +5,10 @@ import {
   MigrationHandle,
   MutatorsConfig,
   PublicMutators,
-  Puller,
+  Syncer,
   Query,
+  MutatorFn,
+  ValidatedConfig,
 } from "./config";
 import { Method, RpcArgs } from "./messages.ts";
 import { Plateform } from "./plateform/plateform.ts";
@@ -37,11 +39,14 @@ export function sql(
 export class SyncEngine<M extends MutatorsConfig> {
   private tablesCache = new Map<string, string[]>();
   private listeners = new Set<Listener>();
-  private puller: Puller;
+  private syncer: Syncer;
 
   private rawMutators: Record<
     string,
-    (tables: Set<string>, payload: unknown) => Promise<void>
+    {
+      fn: (tables: Set<string>, payload: unknown) => Promise<void>;
+      deserialize?: (payload: unknown) => unknown;
+    }
   >;
   mutate: PublicMutators<M>;
 
@@ -53,58 +58,76 @@ export class SyncEngine<M extends MutatorsConfig> {
       {};
     const rawMutators: Record<
       string,
-      (tables: Set<string>, payload: unknown) => Promise<void>
+      {
+        fn: (tables: Set<string>, payload: unknown) => Promise<void>;
+        deserialize?: (payload: unknown) => unknown;
+      }
     > = {};
 
-    this.puller = config.puller;
+    this.syncer = config.syncer;
 
-    for (const [name, fn] of Object.entries(config.mutators)) {
+    for (const [name, mut] of Object.entries(config.mutators)) {
+      let deserialize: ((payload: unknown) => unknown) | undefined = undefined;
+      let fn: MutatorFn<any>;
+      if (typeof mut === "object" && mut !== null) {
+        fn = mut.fn;
+        deserialize = mut.deserialize;
+      } else {
+        fn = mut;
+      }
+
       publicMutators[name] = async (payload) => {
         await this.plateform.lock(async () => {
           const written = new Set<string>();
           try {
-            await this.call("startMutate", undefined);
+            await this.call("startMutate");
             await fn(this.trackingHandle(written), payload);
             await this.call("endMutate", { args: payload, name });
             const tables = [...written.keys()];
             this.notify(tables);
           } catch (e) {
-            await this.call("rollback", undefined);
+            await this.call("rollback");
             throw e;
           }
         });
       };
 
-      rawMutators[name] = async (tables, payload) => {
-        await fn(this.trackingHandle(tables), payload);
+      rawMutators[name] = {
+        fn: async (tables, payload) => {
+          await fn(this.trackingHandle(tables), payload);
+        },
+        deserialize,
       };
     }
 
-    this.mutate = publicMutators as PublicMutators<M>;
+    this.mutate = publicMutators as unknown as PublicMutators<M>;
     this.rawMutators = rawMutators;
   }
 
-  static async create<M extends MutatorsConfig>(
+  static create = async <M extends MutatorsConfig>(
     plateform: Plateform,
-    config: Config<M>,
-  ) {
-    const engine = new SyncEngine(plateform, config);
+    config: ValidatedConfig<M>,
+  ) => {
+    const engine = new SyncEngine<M>(plateform, config);
     if (config.migrations?.length) {
       await engine.applyMigrations(config.migrations);
     }
 
     return engine;
-  }
+  };
 
-  async sql<T = unknown>({ sql, params = [] }: Query, isReadonly = true) {
-    return this.plateform.call("query", {
+  sql = async <T = unknown>({ sql, params = [] }: Query, isReadonly = true) => {
+    return this.call("query", {
       sql,
       params,
       isReadonly,
     }) as Promise<{ rows: T[]; isReadonly: boolean }>;
-  }
+  };
 
-  async reactiveQuery<T = unknown>(query: Query, handler: ReactiveHandlers<T>) {
+  reactiveQuery = async <T = unknown>(
+    query: Query,
+    handler: ReactiveHandlers<T>,
+  ) => {
     const onError =
       handler.onError ??
       function (e) {
@@ -150,41 +173,53 @@ export class SyncEngine<M extends MutatorsConfig> {
         this.listeners.delete(listener);
       },
     };
-  }
+  };
 
-  async sync() {
-    const request = await this.call("beginPull", undefined);
+  private push = async () => {
+    const request = await this.call("pushRequest");
+    if (request.mutations.length > 0) {
+      await this.syncer.push(request);
+    }
+  };
 
-    const response = await this.puller
-      .pull(request.server_version)
-      .catch(async (e) => {
-        await this.call("cancelPull", undefined);
+  sync = async () => {
+    try {
+      await this.push();
+    } finally {
+      const request = await this.call("beginPull");
+      const response = await this.syncer.pull(request).catch(async (e) => {
+        await this.call("cancelPull");
         throw e;
       });
 
-    const endVersion = response.server_version;
+      const endVersion = response.server_version;
 
-    await this.plateform.lock(async () => {
-      const mutations = await this.call("startRebase", response);
-      const updated = new Set<string>();
-      for (const mutation of mutations) {
-        await this.rawMutators[mutation.name](updated, mutation.args);
-      }
-      await this.call("endRebase", endVersion);
-      this.notify([...updated.keys()]);
-    });
-  }
+      await this.plateform.lock(async () => {
+        const mutations = await this.call("startRebase", response);
+        const updated = new Set<string>();
+        for (const mutation of mutations) {
+          const { fn, deserialize } = this.rawMutators[mutation.name];
+          await fn(
+            updated,
+            deserialize ? deserialize(mutation.args) : mutation.args,
+          );
+        }
+        await this.call("endRebase", endVersion);
+        this.notify([...updated.keys()]);
+      });
+    }
+  };
 
-  async exportDatabase(): Promise<Uint8Array<ArrayBuffer>> {
-    const data = await this.call("export", undefined);
+  exportDatabase = async (): Promise<Uint8Array<ArrayBuffer>> => {
+    const data = await this.call("export");
     return data;
-  }
+  };
 
-  close() {
+  close = () => {
     this.listeners.clear();
-  }
+  };
 
-  private dispatch(changes: string[]) {
+  private dispatch = (changes: string[]) => {
     for (const l of this.listeners) {
       for (const table of changes) {
         if (l.tables.has(table)) {
@@ -192,14 +227,14 @@ export class SyncEngine<M extends MutatorsConfig> {
         }
       }
     }
-  }
+  };
 
-  private notify(changes: string[]) {
+  private notify = (changes: string[]) => {
     this.dispatch(changes);
     this.plateform.notifyTablesChanged(changes);
-  }
+  };
 
-  private trackingHandle(written: Set<string>): DBHandle {
+  private trackingHandle = (written: Set<string>): DBHandle => {
     return {
       sql: async (query) => {
         const tables = await this.tablesOf(query.sql);
@@ -211,13 +246,16 @@ export class SyncEngine<M extends MutatorsConfig> {
         return rows;
       },
     };
-  }
+  };
 
-  private async call<M extends Method>(method: M, ...args: [...RpcArgs<M>]) {
+  private call = async <M extends Method>(
+    method: M,
+    ...args: [...RpcArgs<M>]
+  ) => {
     return this.plateform.call(method, ...args);
-  }
+  };
 
-  private async applyMigrations(migrations: Migration[]) {
+  private applyMigrations = async (migrations: Migration[]) => {
     migrations.sort((a, b) => a.version - b.version);
     return this.plateform.lock(async () => {
       let {
@@ -242,17 +280,25 @@ export class SyncEngine<M extends MutatorsConfig> {
         }
       }
     });
-  }
+  };
 
-  private async tablesOf(sql: string): Promise<string[]> {
+  private tablesOf = async (sql: string): Promise<string[]> => {
     const hit = this.tablesCache.get(sql);
     if (hit) return hit;
+
     const { rows } = await this.sql<string>({
       sql: "SELECT name FROM tables_used(?) WHERE type = 'table'",
       params: [sql],
     });
-
     this.tablesCache.set(sql, rows);
     return rows;
-  }
+  };
+
+  listDababases = (): Promise<string[]> => {
+    return this.call("listDatabases");
+  };
+
+  deleteDatabases = (databases: string[]) => {
+    return this.call("deleteDatabases", databases);
+  };
 }

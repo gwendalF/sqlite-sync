@@ -15,5 +15,5 @@ export interface Plateform {
   /** notifications to other tabs */
   notifyTablesChanged(change: string[] | "*"): void;
 
-  close(): void;
+  close(): Promise<void>;
 }

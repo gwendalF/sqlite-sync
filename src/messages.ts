@@ -2,6 +2,7 @@ import type {
   LocalMutations,
   PullRequest,
   PullResponse,
+  PushRequest,
 } from "./sync_sqlite/sync_sqlite.js";
 
 export type ErrorCode = "INITIALISATION_NOT_DONE" | "RUNTIME_ERROR";
@@ -40,6 +41,9 @@ export type RpcMethods = {
   rollback: { args: undefined; result: void };
   export: { args: undefined; result: Uint8Array<ArrayBuffer> };
   close: { args: undefined; result: void };
+  listDatabases: { args: undefined; result: string[] };
+  deleteDatabases: { args: string[]; result: void };
+  pushRequest: { args: undefined; result: PushRequest };
 };
 export type Method = keyof RpcMethods;
 

@@ -4,7 +4,7 @@ import {
   RpcHandlers,
   RpcMethods,
   RustQuery,
-} from "./messages";
+} from "./messages.ts";
 import init, { PullResponse, SqliteEngine } from "./sync_sqlite/sync_sqlite.js";
 
 const makeHandlers = (engine: SqliteEngine): RpcHandlers => ({
@@ -37,6 +37,9 @@ const makeHandlers = (engine: SqliteEngine): RpcHandlers => ({
     return new Uint8Array(data);
   },
   close: () => engine.free(),
+  listDatabases: () => engine.list_databases(),
+  deleteDatabases: (databases) => engine.delete_databases(databases),
+  pushRequest: () => engine.push_request(),
 });
 
 export type WasmSource = Parameters<typeof init>[0];
@@ -44,20 +47,20 @@ export type WasmSource = Parameters<typeof init>[0];
 export class SqliteDB {
   private constructor(private readonly handlers: RpcHandlers) {}
 
-  static async create(
+  static create = async (
     name: string,
     opts?: { wasm?: WasmSource },
-  ): Promise<SqliteDB> {
+  ): Promise<SqliteDB> => {
     await init(opts?.wasm ? { module_or_path: opts.wasm } : undefined);
 
     const rust = await SqliteEngine.create(name);
     return new SqliteDB(makeHandlers(rust));
-  }
+  };
 
-  async handle<M extends Method>(
+  handle = async <M extends Method>(
     method: M,
     ...args: RpcArgs<M>
-  ): Promise<RpcMethods[M]["result"]> {
+  ): Promise<RpcMethods[M]["result"]> => {
     return this.handlers[method](args[0]);
-  }
+  };
 }

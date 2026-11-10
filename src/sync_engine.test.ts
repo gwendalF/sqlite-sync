@@ -1,6 +1,6 @@
 import { describe, test as baseTest, vi } from "vitest";
 import { sql, SyncEngine } from "./sync_engine";
-import { Puller } from "./puller";
+import { Syncer } from "./syncer";
 import { PullResponse } from "./sync_sqlite/sync_sqlite";
 import {
   Config,
@@ -8,19 +8,21 @@ import {
   MigrationHandle,
   MutatorFn,
   MutatorsConfig,
+  ValidatedConfig,
 } from "./config";
 import { Plateform } from "./plateform/plateform";
-import { createTestHub } from "./testing.test";
+import { createTestHub } from "./testing";
 import { SqliteDB } from "./core";
 
 const it = baseTest.extend("hub", async () => {
   return createTestHub();
 });
 
-const stubPuller: Puller = {
+const stubSyncer: Syncer = {
   async pull(): Promise<PullResponse> {
     throw Error("no sync used");
   },
+  async push(): Promise<void> {},
 };
 
 async function getUserVersion(core: SqliteDB): Promise<number> {
@@ -39,18 +41,18 @@ type testMut = { addUser: MutatorFn<string> };
 
 function buildEngine<M extends MutatorsConfig = testMut>(
   plateform: Plateform,
-  opts?: Partial<Config<M>>,
+  opts?: Partial<ValidatedConfig<M>>,
 ): Promise<SyncEngine<M>> {
   return SyncEngine.create(plateform, {
     mutators: {
-      addUser: async (handle, name: string) => {
+      addUser: async (handle: DBHandle, name: string) => {
         await handle.sql({
           sql: "INSERT INTO users(name) VALUES (?)",
           params: [name],
         });
       },
     },
-    puller: stubPuller,
+    syncer: stubSyncer,
     migrations: [
       {
         version: 1,
@@ -62,14 +64,14 @@ function buildEngine<M extends MutatorsConfig = testMut>(
       },
     ],
     ...opts,
-  } as Config<M>);
+  } as ValidatedConfig<M>);
 }
 
 describe("SyncEngine creation", () => {
   it("create a syncEngine", async ({ expect, hub }) => {
     await expect(
       SyncEngine.create(hub.newTab(), {
-        puller: stubPuller,
+        syncer: stubSyncer,
         mutators: {},
       }),
     ).resolves.toBeDefined();
@@ -82,7 +84,7 @@ describe("SyncEngine creation", () => {
 
   it("apply 1 migration on create", async ({ expect, hub }) => {
     const engine = await SyncEngine.create(hub.newTab(), {
-      puller: stubPuller,
+      syncer: stubSyncer,
       mutators: {},
       migrations: [
         {
@@ -143,7 +145,7 @@ describe("SyncEngine creation", () => {
 
     const engine = await buildEngine(hub.newTab(), {
       mutators: {
-        slowMutator: async () => {
+        slowMutator: async (_: DBHandle) => {
           order.push("slow:start");
           signalStarted();
           await gate;
@@ -181,7 +183,7 @@ describe("SyncEngine creation", () => {
   }) => {
     const engine = await buildEngine(hub.newTab(), {
       mutators: {
-        throw: async (h: DBHandle) => {
+        throw: async (_: DBHandle) => {
           return new Promise<void>((_, reject) =>
             setTimeout(() => reject(new Error("invalid mutator")), 0),
           );
@@ -228,6 +230,87 @@ describe("SyncEngine creation", () => {
     expect(
       (await engine.sql({ sql: "SELECT COUNT(*) FROM users" })).rows[0],
     ).toBe(0);
+  });
+
+  it("can pass a parser in the mutator", async ({ expect, hub }) => {
+    const isUser = (p: unknown): p is { name: string; created_at: string } => {
+      const anyP = p as any;
+      return (
+        typeof anyP === "object" &&
+        typeof anyP.name === "string" &&
+        typeof anyP.created_at === "string"
+      );
+    };
+    const engine = await buildEngine(hub.newTab(), {
+      mutators: {
+        withDeserializer: {
+          fn: async (
+            h: DBHandle,
+            payload: { name: string; created_at: Date },
+          ) => {
+            await h.sql(
+              sql`INSERT INTO users(name, created_at) VALUES (${payload.name}, ${payload.created_at.toISOString()})`,
+            );
+          },
+          deserialize: (payload: unknown) => {
+            if (isUser(payload)) {
+              return {
+                name: payload.name,
+                created_at: new Date(payload.created_at),
+              };
+            }
+            throw new Error("invalid payload");
+          },
+        },
+      },
+      migrations: [
+        {
+          version: 1,
+          run: async (db) => {
+            await db.exec(
+              "CREATE TABLE users(name TEXT PRIMARY KEY, created_at TEXT NOT NULL)",
+            );
+          },
+        },
+      ],
+      syncer: {
+        pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
+          server_version: 1,
+          last_mutation_id: 0,
+          mutations: [],
+        }),
+        push: vi.fn(),
+      },
+    });
+
+    const now = new Date();
+    await engine.mutate.withDeserializer({ name: "John", created_at: now });
+    await expect(engine.sync()).resolves.not.toThrow();
+  });
+
+  it("does not call push if there is no pending mutations", async ({
+    expect,
+    hub,
+  }) => {
+    const syncer: Syncer = {
+      push: vi.fn(),
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
+        last_mutation_id: 0,
+        server_version: 0,
+        mutations: [],
+      }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), {
+      syncer,
+    });
+    await engine.sync();
+
+    expect(syncer.push).not.toHaveBeenCalled();
+
+    await engine.mutate.addUser("Gwendal");
+    await engine.sync();
+    expect(syncer.push).toHaveBeenCalled();
   });
 });
 
@@ -363,8 +446,8 @@ describe("have reactive query", () => {
 
 describe("SyncEngine allow to sync", () => {
   it("adds data from the server", async ({ expect, hub }) => {
-    const puller = {
-      pull: vi.fn<Puller["pull"]>().mockResolvedValue({
+    const syncer = {
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
         server_version: 1,
         last_mutation_id: 0,
         mutations: [
@@ -379,9 +462,10 @@ describe("SyncEngine allow to sync", () => {
           },
         ],
       }),
+      push: vi.fn(),
     };
 
-    const engine = await buildEngine(hub.newTab(), { puller });
+    const engine = await buildEngine(hub.newTab(), { syncer });
     await engine.sync();
 
     const {
@@ -391,8 +475,8 @@ describe("SyncEngine allow to sync", () => {
   });
 
   it("deletes data when server says so", async ({ expect, hub }) => {
-    const puller = {
-      pull: vi.fn<Puller["pull"]>().mockResolvedValue({
+    const syncer = {
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
         server_version: 1,
         last_mutation_id: 0,
         mutations: [
@@ -404,9 +488,10 @@ describe("SyncEngine allow to sync", () => {
           },
         ],
       }),
+      push: vi.fn(),
     };
 
-    const engine = await buildEngine(hub.newTab(), { puller });
+    const engine = await buildEngine(hub.newTab(), { syncer });
     await engine.sql(
       sql`INSERT INTO users(id, name) VALUES (${1}, 'Jane'), (2, ${"John"}), (3, 'Not deleted')`,
       false,
@@ -421,8 +506,8 @@ describe("SyncEngine allow to sync", () => {
     expect,
     hub,
   }) => {
-    const puller = {
-      pull: vi.fn<Puller["pull"]>().mockResolvedValue({
+    const syncer = {
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
         server_version: 1,
         last_mutation_id: 0,
         mutations: [
@@ -437,10 +522,11 @@ describe("SyncEngine allow to sync", () => {
           },
         ],
       }),
+      push: vi.fn(),
     };
 
     const engine = await buildEngine(hub.newTab(), {
-      puller,
+      syncer,
       migrations: [
         {
           version: 1,
@@ -463,8 +549,8 @@ describe("SyncEngine allow to sync", () => {
   });
 
   it("replays mutations on server state", async ({ expect, hub }) => {
-    const puller = {
-      pull: vi.fn<Puller["pull"]>().mockResolvedValue({
+    const syncer = {
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
         server_version: 1,
         last_mutation_id: 0,
         mutations: [
@@ -479,10 +565,11 @@ describe("SyncEngine allow to sync", () => {
           },
         ],
       }),
+      push: vi.fn(),
     };
 
     const engine = await buildEngine(hub.newTab(), {
-      puller,
+      syncer,
       mutators: {
         upperName: async (handle: DBHandle) => {
           handle.sql(sql`UPDATE users SET name = upper(name)`);

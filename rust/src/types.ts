@@ -11,7 +11,7 @@ type SqlResult<T = Record<string, unknown>> = {
 
 type PullRequest = {
   client_id: string;
-  server_version: number;
+  known_version: number;
 };
 
 type PullResponse = {
@@ -33,3 +33,10 @@ type LocalMutation = {
 };
 
 type LocalMutations = LocalMutation[];
+
+type PendingMutation = LocalMutation & { id: number };
+
+type PushRequest = {
+  mutations: PendingMutation[];
+  client_id: string;
+};
