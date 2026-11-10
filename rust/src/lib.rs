@@ -82,6 +82,21 @@ macro_rules! console_log {
 
 const ENCRYPTED_VFS: &str = "multipleciphers-opfs-sahpool";
 
+/// OPFS directory holding one SAH pool per database.
+const POOL_ROOT: &str = "sync-sqlite";
+
+/// A pool locks every file of its directory for its worker, so each database
+/// gets its own: two tabs can open two databases at the same time.
+fn pool_directory(db_path: &str) -> Result<String> {
+    let name = db_path.trim_start_matches('/');
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(WasmError::Other(format!(
+            "invalid database name {db_path:?}: expected a file name without '/'"
+        )));
+    }
+    Ok(format!("{POOL_ROOT}/{name}"))
+}
+
 /// An encrypted database opened with no key or a wrong key only fails on the
 /// first page read (SQLITE_NOTADB), so force one and report it clearly.
 fn check_readable(conn: &rusqlite::Connection) -> Result<()> {
@@ -206,7 +221,9 @@ impl SqliteEngine {
         let in_memory = db_path.contains(":memory:");
 
         let pool = if !in_memory {
-            let cfg = OpfsSAHPoolCfgBuilder::new().initial_capacity(12).build();
+            let cfg = OpfsSAHPoolCfgBuilder::new()
+                .directory(&pool_directory(db_path)?)
+                .build();
             let pool = sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(&cfg, true).await?;
             Some(pool)
         } else {

@@ -8,10 +8,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const SQLITE_HEADER = "SQLite format 3\0";
 const SECRET = "very-secret-value-0123456789";
 
-// sqlite-wasm-vfs sahpool layout: one OPFS file per slot in
-// `.opfs-sahpool/.opaque/`, a 4096-byte header starting with the
-// NUL-padded SQLite file name, then the raw database bytes.
-const SAH_DIR = ".opfs-sahpool";
+// sqlite-wasm-vfs sahpool layout: one pool per database in
+// `sync-sqlite/<dbName>/`, one OPFS file per slot in its `.opaque/`, a
+// 4096-byte header starting with the NUL-padded SQLite file name, then the
+// raw database bytes.
+const POOL_ROOT = "sync-sqlite";
 const SAH_HEADER_SIZE = 4096;
 const SAH_NAME_SIZE = 512;
 
@@ -51,7 +52,9 @@ async function writeSecret(p: Plateform) {
 /** Raw bytes of the database file as stored in OPFS (worker must be closed). */
 async function rawDbFile(dbName: string): Promise<Uint8Array> {
   const root = await navigator.storage.getDirectory();
-  const pool = await root.getDirectoryHandle(SAH_DIR);
+  const pool = await (
+    await root.getDirectoryHandle(POOL_ROOT)
+  ).getDirectoryHandle(dbName);
   const opaque = await pool.getDirectoryHandle(".opaque");
   // the terminated worker may still hold the sync access handles for a moment
   for (let attempt = 0; ; attempt++) {

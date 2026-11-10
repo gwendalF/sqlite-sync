@@ -104,6 +104,54 @@ describe("leader", () => {
   });
 });
 
+describe("several databases", () => {
+  // 2 tabs on 2 dbs: 2 leaders, 2 workers, 2 SAH pools opened at the same time
+  it("2 tabs open 2 different OPFS dbs at the same time", async () => {
+    const a = await open(uid(), { dbName: `${uid()}.db` });
+    const b = await open(uid(), {
+      dbName: `${uid()}.db`,
+      encryptionKey: "k",
+    });
+
+    await sql(a, "CREATE TABLE t (x)", [], false);
+    await sql(a, "INSERT INTO t VALUES ('a')", [], false);
+    await sql(b, "CREATE TABLE t (x)", [], false);
+    await sql(b, "INSERT INTO t VALUES ('b')", [], false);
+
+    expect((await sql(a, "SELECT x FROM t")).rows).toEqual(["a"]);
+    expect((await sql(b, "SELECT x FROM t")).rows).toEqual(["b"]);
+  });
+
+  it("closing a db keeps the other one open, and it can be reopened", async () => {
+    const dbA = `${uid()}.db`;
+    const a = await open(uid(), { dbName: dbA });
+    const b = await open(uid(), { dbName: `${uid()}.db` });
+    await sql(a, "CREATE TABLE t (x)", [], false);
+    await sql(a, "INSERT INTO t VALUES (1)", [], false);
+    await a.close();
+
+    expect((await sql(b, "SELECT 1")).rows).toEqual([1]);
+    const again = await open(uid(), { dbName: dbA });
+    expect((await sql(again, "SELECT x FROM t")).rows).toEqual([1]);
+    expect((await sql(b, "SELECT 1")).rows).toEqual([1]);
+  });
+
+  it("each db is stored in its own OPFS directory", async () => {
+    const dbName = `${uid()}.db`;
+    await open(uid(), { dbName });
+
+    const root = await navigator.storage.getDirectory();
+    const pools = await root.getDirectoryHandle("sync-sqlite");
+    await expect(pools.getDirectoryHandle(dbName)).resolves.toBeDefined();
+  });
+
+  it("rejects a db name with '/'", async () => {
+    await expect(open(uid(), { dbName: `${uid()}/x.db` })).rejects.toThrow(
+      /invalid database name/,
+    );
+  });
+});
+
 describe("lock", () => {
   it("exclusion between plateform and order", async () => {
     const ns = uid();
