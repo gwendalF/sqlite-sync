@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it as itBase, vi } from "vitest";
 import { BrowserPlateform, type BrowserPlateformOptions } from "./browser";
 import type { Plateform } from "./plateform";
 
@@ -18,36 +18,37 @@ const sql = (
   isReadonly = true,
 ) => p.call("query", { sql: s, params, isReadonly });
 
-const opened: Plateform[] = [];
-
-async function open(ns: string, o: Partial<BrowserPlateformOptions> = {}) {
-  const plateform = new BrowserPlateform({
-    dbName: ":memory:",
-    namespace: ns,
-    worker,
-    ...o,
+/** The plateforms of a test, closed (and awaited) at its end. */
+const it = itBase.extend("open", ({}, { onCleanup }) => {
+  const opened: Plateform[] = [];
+  onCleanup(async () => {
+    await Promise.all(opened.map((p) => p.close()));
   });
-  await plateform.start();
-  opened.push(plateform);
-  return plateform;
-}
-
-afterEach(() => {
-  for (const p of opened.splice(0)) p.close();
+  return async (ns: string, o: Partial<BrowserPlateformOptions> = {}) => {
+    const plateform = new BrowserPlateform({
+      dbName: ":memory:",
+      namespace: ns,
+      worker,
+      ...o,
+    });
+    await plateform.start();
+    opened.push(plateform);
+    return plateform;
+  };
 });
 
 describe("call", () => {
-  it("call worker and get response", async () => {
+  it("call worker and get response", async ({ open }) => {
     expect((await sql(await open(uid()), "SELECT 1")).rows).toEqual([1]);
   });
 
-  it("invalid syntax", async () => {
+  it("invalid syntax", async ({ open }) => {
     await expect(sql(await open(uid()), "SELEC 1")).rejects.toThrow(
       /syntax error/i,
     );
   });
 
-  it("export: get database export", async () => {
+  it("export: get database export", async ({ open }) => {
     const p = await open(uid());
     await sql(p, "CREATE TABLE t (x)", [], false);
     const data = await p.call("export", undefined);
@@ -56,7 +57,7 @@ describe("call", () => {
 });
 
 describe("leader", () => {
-  it("2 plateforme : 1 leader, 1 DB", async () => {
+  it("2 plateforme : 1 leader, 1 DB", async ({ open }) => {
     const ns = uid();
     const a = await open(ns);
     const b = await open(ns);
@@ -68,7 +69,7 @@ describe("leader", () => {
     expect(held?.filter((l) => l.name === `${ns}:leader`)).toHaveLength(1);
   });
 
-  it("new tab don't break inflights request of other tab", async () => {
+  it("new tab don't break inflights request of other tab", async ({ open }) => {
     const ns = uid();
     const a = await open(ns);
     const inflight = sql(
@@ -79,7 +80,7 @@ describe("leader", () => {
     await expect(inflight).resolves.toBeDefined();
   });
 
-  it("failover: leader leave place for another one", async () => {
+  it("failover: leader leave place for another one", async ({ open }) => {
     const ns = uid();
     const a = await open(ns);
     const b = await open(ns);
@@ -91,7 +92,7 @@ describe("leader", () => {
     );
   });
 
-  it("OPFS data stay after leader close", async () => {
+  it("OPFS data stay after leader close", async ({ open }) => {
     const ns = uid();
     const dbName = `${ns}.db`;
     const a = await open(ns, { dbName });
@@ -106,7 +107,7 @@ describe("leader", () => {
 
 describe("several databases", () => {
   // 2 tabs on 2 dbs: 2 leaders, 2 workers, 2 SAH pools opened at the same time
-  it("2 tabs open 2 different OPFS dbs at the same time", async () => {
+  it("2 tabs open 2 different OPFS dbs at the same time", async ({ open }) => {
     const a = await open(uid(), { dbName: `${uid()}.db` });
     const b = await open(uid(), {
       dbName: `${uid()}.db`,
@@ -122,7 +123,7 @@ describe("several databases", () => {
     expect((await sql(b, "SELECT x FROM t")).rows).toEqual(["b"]);
   });
 
-  it("closing a db keeps the other one open, and it can be reopened", async () => {
+  it("closing a db keeps the other one open, and it can be reopened", async ({ open }) => {
     const dbA = `${uid()}.db`;
     const a = await open(uid(), { dbName: dbA });
     const b = await open(uid(), { dbName: `${uid()}.db` });
@@ -136,7 +137,7 @@ describe("several databases", () => {
     expect((await sql(b, "SELECT 1")).rows).toEqual([1]);
   });
 
-  it("each db is stored in its own OPFS directory", async () => {
+  it("each db is stored in its own OPFS directory", async ({ open }) => {
     const dbName = `${uid()}.db`;
     await open(uid(), { dbName });
 
@@ -145,7 +146,7 @@ describe("several databases", () => {
     await expect(pools.getDirectoryHandle(dbName)).resolves.toBeDefined();
   });
 
-  it("rejects a db name with '/'", async () => {
+  it("rejects a db name with '/'", async ({ open }) => {
     await expect(open(uid(), { dbName: `${uid()}/x.db` })).rejects.toThrow(
       /invalid database name/,
     );
@@ -153,7 +154,7 @@ describe("several databases", () => {
 });
 
 describe("lock", () => {
-  it("exclusion between plateform and order", async () => {
+  it("exclusion between plateform and order", async ({ open }) => {
     const ns = uid();
     const a = await open(ns);
     const b = await open(ns);
@@ -171,7 +172,7 @@ describe("lock", () => {
     expect(order).toEqual(["a:start", "a:end", "b"]);
   });
 
-  it("error drop lock", async () => {
+  it("error drop lock", async ({ open }) => {
     const p = await open(uid());
     await expect(
       p.lock(async () => {
@@ -183,7 +184,7 @@ describe("lock", () => {
 });
 
 describe("notifications", () => {
-  it("delivered to others not to sender", async () => {
+  it("delivered to others not to sender", async ({ open }) => {
     const ns = uid();
     const a = await open(ns);
     const b = await open(ns);
@@ -198,7 +199,7 @@ describe("notifications", () => {
     expect(onA).not.toHaveBeenCalled();
   });
 
-  it("isolated by namespace", async () => {
+  it("isolated by namespace", async ({ open }) => {
     const a = await open(uid());
     const other = await open(uid());
     const onOther = vi.fn();
@@ -208,7 +209,7 @@ describe("notifications", () => {
     expect(onOther).not.toHaveBeenCalled();
   });
 
-  it("unsubscribe", async () => {
+  it("unsubscribe", async ({ open }) => {
     const ns = uid();
     const a = await open(ns);
     const b = await open(ns);
@@ -221,7 +222,7 @@ describe("notifications", () => {
 });
 
 describe("open and close", () => {
-  it("tab1 close, tab2 get leader, tab3 inflights request are replayed", async () => {
+  it("tab1 close, tab2 get leader, tab3 inflights request are replayed", async ({ open }) => {
     const ns = uid();
     const a = await open(ns);
     const b = await open(ns);
@@ -236,7 +237,7 @@ describe("open and close", () => {
     await expect(inflight).resolves.toBeDefined();
   });
 
-  it("follower close does not close the leader database", async () => {
+  it("follower close does not close the leader database", async ({ open }) => {
     const ns = uid();
     const leader = await open(ns);
     const follower = await open(ns);
@@ -245,7 +246,7 @@ describe("open and close", () => {
     expect((await sql(leader, "SELECT 1")).rows).toEqual([1]);
   });
 
-  it("close is idempotent and later calls are rejected", async () => {
+  it("close is idempotent and later calls are rejected", async ({ open }) => {
     const p = await open(uid());
     await p.close();
     await expect(p.close()).resolves.toBeUndefined();

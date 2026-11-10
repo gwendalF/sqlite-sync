@@ -96,7 +96,11 @@ export type ChannelRequest = {
 
 export type ChannelMessage =
   | { type: "hello" }
-  | { type: "leader-up"; leaderId: string }
+  | {
+      type: "leader-up";
+      leaderId: string;
+      keyCheck: string | null;
+    }
   | ChannelRequest
   | { type: "response"; id: string; ok: true; value: unknown }
   | {

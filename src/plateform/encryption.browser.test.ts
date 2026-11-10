@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it as itBase, vi } from "vitest";
 import { BrowserPlateform, type BrowserPlateformOptions } from "./browser";
 import type { Plateform } from "./plateform";
 
@@ -16,27 +16,31 @@ const POOL_ROOT = "sync-sqlite";
 const SAH_HEADER_SIZE = 4096;
 const SAH_NAME_SIZE = 512;
 
-const opened = new Set<Plateform>();
-
-afterEach(async () => {
-  for (const p of opened) await p.close();
-  opened.clear();
-});
-
-async function open(
-  dbName: string,
-  o: Partial<BrowserPlateformOptions> = {},
-): Promise<Plateform> {
-  const p = new BrowserPlateform({ dbName, namespace: uid(), ...o });
-  await p.start();
-  opened.add(p);
-  return p;
-}
-
-async function close(p: Plateform) {
-  opened.delete(p);
-  await p.close();
-}
+/** The plateforms of a test, closed (and awaited) at its end. */
+const it = itBase
+  .extend("track", ({}, { onCleanup }) => {
+    const opened = new Set<Plateform>();
+    onCleanup(async () => {
+      await Promise.all([...opened].map((p) => p.close()));
+    });
+    return <P extends Plateform>(p: P) => (opened.add(p), p);
+  })
+  .extend(
+    "open",
+    ({ track }) =>
+      async (dbName: string, o: Partial<BrowserPlateformOptions> = {}) => {
+        const p = new BrowserPlateform({ dbName, namespace: uid(), ...o });
+        await p.start();
+        return track(p);
+      },
+  )
+  /** A tab of the same db as `dbName`, sharing its leader. */
+  .extend(
+    "tab",
+    ({ open }) =>
+      (dbName: string, o: Partial<BrowserPlateformOptions> = {}) =>
+        open(dbName, { namespace: dbName, ...o }),
+  );
 
 const exec = (p: Plateform, sql: string, params: unknown[] = []) =>
   p.call("query", { sql, params, isReadonly: false });
@@ -98,22 +102,22 @@ const containsText = (bytes: Uint8Array, text: string) => {
 };
 
 describe("encryption", () => {
-  it("without key the database file is plain SQLite", async () => {
+  it("without key the database file is plain SQLite", async ({ open }) => {
     const dbName = `${uid()}.db`;
     const p = await open(dbName);
     await writeSecret(p);
-    await close(p);
+    await p.close();
 
     const raw = await rawDbFile(dbName);
     expect(startsWithSqliteHeader(raw)).toBe(true);
     expect(containsText(raw, SECRET)).toBe(true);
   });
 
-  it("with a key the database file is encrypted and readable with the key", async () => {
+  it("with a key the database file is encrypted and readable with the key", async ({ open }) => {
     const dbName = `${uid()}.db`;
     const p = await open(dbName, { encryptionKey: "k1" });
     await writeSecret(p);
-    await close(p);
+    await p.close();
 
     const raw = await rawDbFile(dbName);
     expect(raw.length).toBeGreaterThan(0);
@@ -124,11 +128,11 @@ describe("encryption", () => {
     expect(await query(again, "SELECT v FROM secrets")).toEqual([SECRET]);
   });
 
-  it("cannot be read without the key or with a wrong key", async () => {
+  it("cannot be read without the key or with a wrong key", async ({ open }) => {
     const dbName = `${uid()}.db`;
     const p = await open(dbName, { encryptionKey: "k1" });
     await writeSecret(p);
-    await close(p);
+    await p.close();
 
     await expect(open(dbName)).rejects.toThrow(/encrypted/);
     await expect(open(dbName, { encryptionKey: "wrong" })).rejects.toThrow(
@@ -140,12 +144,12 @@ describe("encryption", () => {
     expect(await query(ok, "SELECT v FROM secrets")).toEqual([SECRET]);
   });
 
-  it("can encrypt an existing plain database", async () => {
+  it("can encrypt an existing plain database", async ({ open }) => {
     const dbName = `${uid()}.db`;
     const p = await open(dbName);
     await writeSecret(p);
     await p.call("rekey", "k2");
-    await close(p);
+    await p.close();
 
     const raw = await rawDbFile(dbName);
     expect(startsWithSqliteHeader(raw)).toBe(false);
@@ -156,12 +160,12 @@ describe("encryption", () => {
     expect(await query(again, "SELECT v FROM secrets")).toEqual([SECRET]);
   });
 
-  it("can decrypt an encrypted database", async () => {
+  it("can decrypt an encrypted database", async ({ open }) => {
     const dbName = `${uid()}.db`;
     const p = await open(dbName, { encryptionKey: "k3" });
     await writeSecret(p);
     await p.call("rekey", null);
-    await close(p);
+    await p.close();
 
     const raw = await rawDbFile(dbName);
     expect(startsWithSqliteHeader(raw)).toBe(true);
@@ -171,12 +175,12 @@ describe("encryption", () => {
     expect(await query(again, "SELECT v FROM secrets")).toEqual([SECRET]);
   });
 
-  it("can change the key", async () => {
+  it("can change the key", async ({ open }) => {
     const dbName = `${uid()}.db`;
     const p = await open(dbName, { encryptionKey: "old" });
     await writeSecret(p);
     await p.call("rekey", "new");
-    await close(p);
+    await p.close();
 
     await expect(open(dbName, { encryptionKey: "old" })).rejects.toThrow(
       /encrypted/,
@@ -185,9 +189,92 @@ describe("encryption", () => {
     expect(await query(again, "SELECT v FROM secrets")).toEqual([SECRET]);
   });
 
-  it("rejects a key on an in-memory database", async () => {
+  it("rejects a key on an in-memory database", async ({ open }) => {
     await expect(
       open(":memory:", { encryptionKey: "k" }),
     ).rejects.toThrow(/in-memory/);
+  });
+});
+
+describe("several tabs", () => {
+  const leaderHeld = async (dbName: string) =>
+    (await navigator.locks.query()).held?.some(
+      (l) => l.name === `${dbName}:leader`,
+    );
+
+  it("a tab with the key joins the leader", async ({ tab }) => {
+    const dbName = `${uid()}.db`;
+    const leader = await tab(dbName, { encryptionKey: "k1" });
+    await writeSecret(leader);
+
+    const follower = await tab(dbName, { encryptionKey: async () => "k1" });
+    expect(await query(follower, "SELECT v FROM secrets")).toEqual([SECRET]);
+  });
+
+  it("a tab with a wrong key or without key cannot join the leader", async ({ tab }) => {
+    const dbName = `${uid()}.db`;
+    const leader = await tab(dbName, { encryptionKey: "k1" });
+    await writeSecret(leader);
+
+    await expect(tab(dbName, { encryptionKey: "wrong" })).rejects.toThrow(
+      /encrypted/,
+    );
+    await expect(tab(dbName)).rejects.toThrow(/encrypted/);
+    expect(await query(leader, "SELECT v FROM secrets")).toEqual([SECRET]);
+  });
+
+  it("a tab with a key cannot join a plain leader", async ({ tab }) => {
+    const dbName = `${uid()}.db`;
+    await tab(dbName);
+
+    await expect(tab(dbName, { encryptionKey: "k1" })).rejects.toThrow(
+      /encrypted/,
+    );
+  });
+
+  it("the leader start fails on a wrong key even if a tab joins meanwhile", async ({ tab, track }) => {
+    const dbName = `${uid()}.db`;
+    await (await tab(dbName, { encryptionKey: "k1" })).close();
+
+    const leader = track(
+      new BrowserPlateform({ dbName, encryptionKey: "wrong" }),
+    );
+    const started = leader.start();
+    // the leader holds the lock, its worker is still opening the db
+    await vi.waitUntil(() => leaderHeld(dbName), { interval: 1 });
+    const joining = tab(dbName, { encryptionKey: "k1" });
+
+    await expect(started).rejects.toThrow(/encrypted/);
+    // the joining tab takes the lead and opens the db with the right key
+    await expect(joining).resolves.toBeDefined();
+  });
+
+  it("a tab joining while the leader opens the db gets answers", async ({ tab, track }) => {
+    const dbName = `${uid()}.db`;
+    const leader = track(
+      new BrowserPlateform({ dbName, encryptionKey: "k1" }),
+    );
+    const started = leader.start();
+    await vi.waitUntil(() => leaderHeld(dbName), { interval: 1 });
+    const follower = await tab(dbName, { encryptionKey: "k1" });
+
+    await started;
+    await writeSecret(follower);
+    expect(await query(leader, "SELECT v FROM secrets")).toEqual([SECRET]);
+  });
+
+  it("a tab taking the lead that cannot open the db rejects its calls", async ({ tab }) => {
+    const dbName = `${uid()}.db`;
+    const leader = await tab(dbName, { encryptionKey: "k1" });
+    const onError = vi.fn();
+    const follower = await tab(dbName, { encryptionKey: "k1", onError });
+    await writeSecret(leader);
+    // the key of the follower does not open the db anymore
+    await leader.call("rekey", "k2");
+    await leader.close();
+
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+    expect(onError.mock.calls[0][0].message).toMatch(/encrypted/);
+    await expect(query(follower, "SELECT 1")).rejects.toThrow(/encrypted/);
   });
 });
