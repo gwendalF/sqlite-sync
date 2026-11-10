@@ -13,7 +13,16 @@ export type BrowserPlateformOptions = {
   dbName: string;
   namespace?: string;
   worker?: () => Worker;
+  /**
+   * Encrypts the database file with SQLite3MultipleCiphers (ChaCha20 by default).
+   * Omitted: the database is stored in plain text. Only fetched by the tab that
+   * becomes leader, and sent straight to its worker (never broadcast).
+   */
+  encryptionKey?: string | (() => string | Promise<string>);
 };
+
+const CLOSE_TIMEOUT_MS = 2_000;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type Pending = {
   resolve(v: unknown): void;
@@ -28,8 +37,11 @@ export class BrowserPlateform implements Plateform {
   private lastLeaderId = "";
   private rpc;
   private reactive;
-  private worker: Worker | null = null;
   private release: undefined | (() => void);
+  /** Settles once this tab no longer holds (nor waits for) leadership. */
+  private leadership: Promise<void> = Promise.resolve();
+  private closed = false;
+  private failStart: undefined | ((err: Error) => void);
   private namespaces: {
     task: string;
     rpc: string;
@@ -54,9 +66,28 @@ export class BrowserPlateform implements Plateform {
   }
 
   start = async () => {
-    this.release = this.claimLeaderShip(this.namespaces, this.opts.dbName);
+    try {
+      await this.waitLeader();
+    } catch (err) {
+      this.closed = true;
+      this.release?.();
+      this.reactive.close();
+      this.rpc.close();
+      throw err;
+    } finally {
+      this.failStart = undefined;
+    }
+  };
 
-    await new Promise<void>((resolve) => {
+  private waitLeader = () =>
+    new Promise<void>((resolve, reject) => {
+      this.failStart = reject;
+      const { release, done } = this.claimLeaderShip(
+        this.namespaces,
+        this.opts.dbName,
+      );
+      this.release = release;
+      this.leadership = done;
       this.rpc.addEventListener(
         "message",
         (e: MessageEvent<ChannelMessage>) => {
@@ -80,14 +111,13 @@ export class BrowserPlateform implements Plateform {
       );
       this.rpc.postMessage({ type: "hello" } satisfies ChannelMessage);
     });
-  };
 
   private claimLeaderShip = (
     namespaces: { task: string; rpc: string; leader: string },
     dbConfig: string,
   ) => {
     const abort = new AbortController();
-    navigator.locks
+    const done = navigator.locks
       .request(namespaces.leader, { signal: abort.signal }, async () => {
         const leaderId = crypto.randomUUID();
         const worker = new Worker(new URL("../worker.js", import.meta.url), {
@@ -95,7 +125,6 @@ export class BrowserPlateform implements Plateform {
         });
         const broadcast = new BroadcastChannel(namespaces.rpc);
 
-        this.worker = worker;
         try {
           let resolveInit: () => void;
           let rejectInit: (err: Error) => void;
@@ -110,13 +139,30 @@ export class BrowserPlateform implements Plateform {
                 type: "leader-up",
                 leaderId,
               } satisfies ChannelMessage);
+            } else if (e.data.type === "request" && e.data.method === "close") {
+              // closing the shared database is the leader's job, see close()
+              broadcast.postMessage({
+                type: "response",
+                id: e.data.id,
+                ok: false,
+                error: {
+                  code: "RUNTIME_ERROR",
+                  message: "close is not callable over rpc, use plateform.close()",
+                },
+              } satisfies ChannelMessage);
             } else if (e.data.type === "request") {
               worker.postMessage(e.data);
             }
           };
 
+          const closeId = crypto.randomUUID();
+          let resolveDbClosed: () => void;
+          const dbClosed = new Promise<void>((r) => (resolveDbClosed = r));
+
           worker.onmessage = (e: MessageEvent<WorkerResponse>) => {
-            if (e.data.type === "response") {
+            if (e.data.type === "response" && e.data.id === closeId) {
+              resolveDbClosed();
+            } else if (e.data.type === "response") {
               broadcast.postMessage(e.data);
             } else if (e.data.type === "ready") {
               resolveInit();
@@ -125,9 +171,14 @@ export class BrowserPlateform implements Plateform {
             }
           };
 
+          const { encryptionKey } = this.opts;
           worker.postMessage({
             type: "init",
             dbName: dbConfig,
+            encryptionKey:
+              typeof encryptionKey === "function"
+                ? await encryptionKey()
+                : encryptionKey,
           } satisfies WorkerRequest);
           await initPromise;
 
@@ -151,8 +202,18 @@ export class BrowserPlateform implements Plateform {
               },
             );
           });
+
+          // Leaving: stop taking requests (other tabs replay them on the next
+          // leader), let already forwarded ones answer, then close the DB.
+          broadcast.onmessage = null;
+          worker.postMessage({
+            type: "request",
+            id: closeId,
+            method: "close",
+            args: undefined,
+          } satisfies WorkerRequest);
+          await Promise.race([dbClosed, sleep(CLOSE_TIMEOUT_MS)]);
         } finally {
-          this.worker = null;
           worker.terminate();
           broadcast.close();
         }
@@ -162,10 +223,14 @@ export class BrowserPlateform implements Plateform {
           // abort signal
           return;
         }
-        throw err;
+        if (this.failStart) {
+          this.failStart(err instanceof Error ? err : new Error(`${err}`));
+          return;
+        }
+        console.error(err);
       });
 
-    return () => abort.abort();
+    return { release: () => abort.abort(), done };
   };
 
   private replayInflights = () => {
@@ -183,6 +248,9 @@ export class BrowserPlateform implements Plateform {
     method: M,
     ...args: RpcArgs<M>
   ): Promise<RpcMethods[M]["result"]> => {
+    if (this.closed) {
+      throw new Error("plateform closed");
+    }
     return new Promise((resolve, reject) => {
       const id = crypto.randomUUID();
       const message: RequestFor<M> = {
@@ -217,12 +285,22 @@ export class BrowserPlateform implements Plateform {
     this.reactive.postMessage(tables);
   };
 
+  /**
+   * Leaves the group. Only the leader closes the database (in its own worker),
+   * other tabs keep using it through the next leader. Idempotent.
+   */
   close = async () => {
-    await this.call("close");
+    if (this.closed) return;
+    this.closed = true;
 
     this.release?.();
+    await this.leadership;
     this.reactive.close();
     this.rpc.close();
-    this.worker?.terminate();
+
+    for (const { reject } of this.inflights.values()) {
+      reject(new Error("plateform closed"));
+    }
+    this.inflights.clear();
   };
 }

@@ -11,8 +11,8 @@ const postBytes = (id: string, data: Uint8Array) =>
 self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   if (event.data.type === "init") {
     try {
-      const { dbName } = event.data;
-      sqlDb = await SqliteDB.create(dbName);
+      const { dbName, encryptionKey } = event.data;
+      sqlDb = await SqliteDB.create(dbName, { encryptionKey });
       post({ type: "ready" });
     } catch (e) {
       post({
@@ -44,6 +44,15 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     if (method === "export") {
       const result = await sqlDb.handle(method);
       postBytes(id, result);
+      return;
+    }
+
+    if (method === "close") {
+      // the wasm engine is freed: never hand it out again
+      const db = sqlDb;
+      sqlDb = undefined;
+      await db.handle(method);
+      post({ type: "response", id, ok: true, value: undefined });
       return;
     }
 

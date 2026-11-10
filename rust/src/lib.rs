@@ -80,6 +80,24 @@ macro_rules! console_log {
     ($($t:tt)*) => (log(&format_args!($($t)*).to_string()))
 }
 
+const ENCRYPTED_VFS: &str = "multipleciphers-opfs-sahpool";
+
+/// An encrypted database opened with no key or a wrong key only fails on the
+/// first page read (SQLITE_NOTADB), so force one and report it clearly.
+fn check_readable(conn: &rusqlite::Connection) -> Result<()> {
+    match conn.query_row("SELECT count(*) FROM sqlite_schema", (), |_| Ok(())) {
+        Ok(()) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::NotADatabase =>
+        {
+            Err(WasmError::Other(String::from(
+                "cannot read database: it is encrypted and the key is missing or invalid",
+            )))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 #[derive(Deserialize, Debug)]
 pub struct SqlQuery {
     pub sql: String,
@@ -183,8 +201,11 @@ impl<'a> From<RollbackErr<'a>> for WasmError {
 #[wasm_bindgen]
 impl SqliteEngine {
     #[wasm_bindgen]
-    pub async fn create(db_path: &str) -> Result<Self> {
-        let pool = if !db_path.contains(":memory:") {
+    pub async fn create(db_path: &str, encryption_key: Option<String>) -> Result<Self> {
+        let encryption_key = encryption_key.filter(|k| !k.is_empty());
+        let in_memory = db_path.contains(":memory:");
+
+        let pool = if !in_memory {
             let cfg = OpfsSAHPoolCfgBuilder::new().initial_capacity(12).build();
             let pool = sqlite_wasm_vfs::sahpool::install::<WasmOsCallback>(&cfg, true).await?;
             Some(pool)
@@ -192,7 +213,30 @@ impl SqliteEngine {
             None
         };
 
-        let conn = rusqlite::Connection::open(db_path)?;
+        let conn = if in_memory {
+            if encryption_key.is_some() {
+                return Err(WasmError::Other(String::from(
+                    "encryption is not supported for in-memory databases",
+                )));
+            }
+            rusqlite::Connection::open(db_path)?
+        } else {
+            // sqlite3mc only wraps the VFS that was the default when SQLite was
+            // initialised (the memory VFS). Naming "multipleciphers-<vfs>" makes
+            // sqlite3mc create the encryption shim around opfs-sahpool on open.
+            // Without a key the shim is a pass-through and the file stays plain.
+            rusqlite::Connection::open_with_flags_and_vfs(
+                db_path,
+                rusqlite::OpenFlags::default(),
+                ENCRYPTED_VFS,
+            )?
+        };
+
+        if let Some(key) = &encryption_key {
+            // must be the very first statement on the connection
+            conn.pragma_update(None, "key", key)?;
+        }
+        check_readable(&conn)?;
 
         conn.execute_batch(
             "
@@ -542,6 +586,18 @@ impl SqliteEngine {
     pub fn export_db(&mut self) -> Result<Vec<u8>> {
         let data = self.connection.serialize("main")?;
         Ok(data.to_vec())
+    }
+
+    #[wasm_bindgen]
+    pub fn rekey(&self, encryption_key: Option<String>) -> Result<()> {
+        if self.pool.is_none() {
+            return Err(WasmError::Other(String::from(
+                "encryption is not supported for in-memory databases",
+            )));
+        }
+        let key = encryption_key.unwrap_or_default();
+        self.connection.pragma_update(None, "rekey", key)?;
+        Ok(())
     }
 
     #[wasm_bindgen]

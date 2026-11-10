@@ -187,4 +187,20 @@ describe("open and close", () => {
 
     await expect(inflight).resolves.toBeDefined();
   });
+
+  it("follower close does not close the leader database", async () => {
+    const ns = uid();
+    const leader = await open(ns);
+    const follower = await open(ns);
+    await follower.close();
+
+    expect((await sql(leader, "SELECT 1")).rows).toEqual([1]);
+  });
+
+  it("close is idempotent and later calls are rejected", async () => {
+    const p = await open(uid());
+    await p.close();
+    await expect(p.close()).resolves.toBeUndefined();
+    await expect(sql(p, "SELECT 1")).rejects.toThrow(/closed/);
+  });
 });

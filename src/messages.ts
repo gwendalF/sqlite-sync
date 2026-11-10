@@ -44,6 +44,7 @@ export type RpcMethods = {
   listDatabases: { args: undefined; result: string[] };
   deleteDatabases: { args: string[]; result: void };
   pushRequest: { args: undefined; result: PushRequest };
+  rekey: { args: string | null; result: void };
 };
 export type Method = keyof RpcMethods;
 
@@ -66,7 +67,7 @@ export type SerializedError = {
 };
 
 export type WorkerRequest =
-  | { type: "init"; dbName: string }
+  | { type: "init"; dbName: string; encryptionKey?: string }
   | {
       [M in Method]: {
         type: "request";

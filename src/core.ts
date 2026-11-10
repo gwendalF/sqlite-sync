@@ -40,6 +40,7 @@ const makeHandlers = (engine: SqliteEngine): RpcHandlers => ({
   listDatabases: () => engine.list_databases(),
   deleteDatabases: (databases) => engine.delete_databases(databases),
   pushRequest: () => engine.push_request(),
+  rekey: (key) => engine.rekey(key),
 });
 
 export type WasmSource = Parameters<typeof init>[0];
@@ -49,11 +50,11 @@ export class SqliteDB {
 
   static create = async (
     name: string,
-    opts?: { wasm?: WasmSource },
+    opts?: { wasm?: WasmSource; encryptionKey?: string },
   ): Promise<SqliteDB> => {
     await init(opts?.wasm ? { module_or_path: opts.wasm } : undefined);
 
-    const rust = await SqliteEngine.create(name);
+    const rust = await SqliteEngine.create(name, opts?.encryptionKey);
     return new SqliteDB(makeHandlers(rust));
   };
 
