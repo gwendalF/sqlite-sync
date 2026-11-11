@@ -126,7 +126,6 @@ pub struct SqliteEngine {
     connection: Pin<Box<rusqlite::Connection>>,
     pool: Option<sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil>,
     server_version: usize,
-    pull_state: PullState,
     push_state: PushState,
 }
 
@@ -183,12 +182,6 @@ pub struct Mutation {
     name: String,
     args: Option<serde_json::Value>,
     changeset: Vec<u8>,
-}
-
-#[derive(Debug)]
-enum PullState {
-    Idle,
-    Awaiting,
 }
 
 enum PushState {
@@ -299,7 +292,6 @@ impl SqliteEngine {
             connection: Box::pin(conn),
             pool,
             server_version: id as usize,
-            pull_state: PullState::Idle,
             push_state: PushState::Idle,
         })
     }
@@ -436,10 +428,6 @@ impl SqliteEngine {
 
     #[wasm_bindgen]
     pub fn begin_pull(&mut self) -> Result<JsPullRequest> {
-        if !matches!(self.pull_state, PullState::Idle) {
-            return Err(WasmError::Other(String::from("pull state not idle")));
-        }
-
         let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
         let request = PullRequest {
             known_version: self.server_version,
@@ -447,23 +435,21 @@ impl SqliteEngine {
         };
 
         let js_req = request.serialize(&serializer)?;
-        self.pull_state = PullState::Awaiting;
         Ok(js_req.into())
     }
 
+    /// Pulls can run concurrently (several tabs, or several syncs of the same tab), so their
+    /// responses may arrive out of order. A response older than the state already applied is
+    /// stale: nothing is done and `None` is returned, the caller must not call `end_rebasing`.
     #[wasm_bindgen]
-    pub fn cancel_pull(&mut self) -> Result<()> {
-        if !matches!(self.pull_state, PullState::Awaiting) {
-            return Err(WasmError::Other(String::from("no pull in progress")));
-        }
-        self.pull_state = PullState::Idle;
-        Ok(())
-    }
-
-    #[wasm_bindgen]
-    pub fn start_rebasing(&mut self, response: JsPullResponse) -> Result<JsLocalMutations> {
+    pub fn start_rebasing(
+        &mut self,
+        response: JsPullResponse,
+    ) -> Result<Option<JsLocalMutations>> {
         let response: PullResponse = serde_wasm_bindgen::from_value(response.into())?;
-        self.pull_state = PullState::Idle;
+        if response.server_version < self.server_version {
+            return Ok(None);
+        }
 
         let mut stmt = self.connection.prepare_cached("BEGIN")?;
         stmt.execute(())?;
@@ -518,12 +504,11 @@ impl SqliteEngine {
             conn: &self.connection,
         })?;
 
-        Ok(response.into())
+        Ok(Some(response.into()))
     }
 
     #[wasm_bindgen]
     pub fn end_rebasing(&mut self, server_version: usize) -> Result<()> {
-        self.pull_state = PullState::Idle;
         self.connection.execute("COMMIT", ())?;
         self.server_version = server_version;
         Ok(())

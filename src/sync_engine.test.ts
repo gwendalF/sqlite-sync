@@ -53,6 +53,7 @@ function buildEngine<M extends MutatorsConfig = testMut>(
       },
     },
     syncer: stubSyncer,
+    autoSync: false,
     migrations: [
       {
         version: 1,
@@ -587,6 +588,171 @@ describe("SyncEngine allow to sync", () => {
       { id: 1, name: "JOHN" },
       { id: 2, name: "ME" },
     ]); // mutation applied
+  });
+
+  it("rolls back the rebase when a replayed mutation fails", async ({
+    expect,
+    hub,
+  }) => {
+    const syncer: Syncer = {
+      push: vi.fn(),
+      // the server already has a user with the id used by the local mutation
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
+        server_version: 1,
+        last_mutation_id: 0,
+        mutations: [
+          {
+            op: "upsert",
+            table: "users",
+            pks: ["id"],
+            records: [{ id: 1, name: "server" }],
+          },
+        ],
+      }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), {
+      syncer,
+      mutators: {
+        insertUser: async (
+          handle: DBHandle,
+          user: { id: number; name: string },
+        ) => {
+          await handle.sql(
+            sql`INSERT INTO users(id, name) VALUES (${user.id}, ${user.name})`,
+          );
+        },
+      },
+    });
+
+    await engine.mutate.insertUser({ id: 1, name: "local" });
+    // replaying the INSERT on top of the server state violates the primary key
+    await expect(engine.sync()).rejects.toThrow();
+
+    // the engine is still usable and the local state is the one before the pull
+    await expect(
+      engine.mutate.insertUser({ id: 2, name: "other" }),
+    ).resolves.toBeUndefined();
+    const { rows } = await engine.sql(sql`SELECT * FROM users ORDER BY id`);
+    expect(rows).toMatchObject([
+      { id: 1, name: "local" },
+      { id: 2, name: "other" },
+    ]);
+  });
+
+  it("calls sync after a mutation when autoSync is enabled", async ({
+    expect,
+    hub,
+  }) => {
+    const syncer: Syncer = {
+      push: vi.fn(),
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
+        last_mutation_id: 1,
+        server_version: 1,
+        mutations: [],
+      }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), { syncer, autoSync: true });
+    expect(syncer.push).not.toHaveBeenCalled();
+
+    await engine.mutate.addUser("Jane");
+    // sync is fire-and-forget, so it may complete after mutate resolves
+    await vi.waitFor(() => expect(syncer.pull).toHaveBeenCalled());
+    expect(syncer.push).toHaveBeenCalledOnce();
+  });
+
+  it("does not sync after a mutation when autoSync is disabled", async ({
+    expect,
+    hub,
+  }) => {
+    const syncer: Syncer = { push: vi.fn(), pull: vi.fn() };
+
+    const engine = await buildEngine(hub.newTab(), { syncer, autoSync: false });
+    await engine.mutate.addUser("Jane");
+
+    expect(syncer.push).not.toHaveBeenCalled();
+    expect(syncer.pull).not.toHaveBeenCalled();
+  });
+});
+
+describe("concurrent syncs", () => {
+  const usersAt = (
+    server_version: number,
+    name: string,
+  ): PullResponse => ({
+    server_version,
+    last_mutation_id: 0,
+    mutations: [
+      { op: "upsert", table: "users", pks: ["id"], records: [{ id: 1, name }] },
+    ],
+  });
+
+  /** Syncer whose n-th pull is answered by calling `resolve[n]` */
+  const deferredSyncer = () => {
+    const resolve: ((response: PullResponse) => void)[] = [];
+    const syncer: Syncer = {
+      push: vi.fn(),
+      pull: vi.fn<Syncer["pull"]>(
+        () => new Promise((r) => void resolve.push(r)),
+      ),
+    };
+    return { syncer, resolve };
+  };
+
+  it("ignores a stale pull response arriving after a newer one", async ({
+    expect,
+    hub,
+  }) => {
+    const { syncer, resolve } = deferredSyncer();
+
+    const engine = await buildEngine(hub.newTab(), { syncer });
+    const first = engine.sync();
+    const second = engine.sync();
+    await vi.waitFor(() => expect(syncer.pull).toHaveBeenCalledTimes(2));
+
+    // the second request is answered first, with the newest state
+    resolve[1](usersAt(2, "new"));
+    await second;
+    resolve[0](usersAt(1, "old"));
+    await first;
+
+    const { rows } = await engine.sql(sql`SELECT * FROM users`);
+    expect(rows).toMatchObject([{ id: 1, name: "new" }]);
+  });
+
+  it("applies a newer pull response arriving after an older one", async ({
+    expect,
+    hub,
+  }) => {
+    const { syncer, resolve } = deferredSyncer();
+
+    const engine = await buildEngine(hub.newTab(), { syncer });
+    const first = engine.sync();
+    const second = engine.sync();
+    await vi.waitFor(() => expect(syncer.pull).toHaveBeenCalledTimes(2));
+
+    resolve[0](usersAt(1, "old"));
+    await first;
+    resolve[1](usersAt(2, "new"));
+    await second;
+
+    const { rows } = await engine.sql(sql`SELECT * FROM users`);
+    expect(rows).toMatchObject([{ id: 1, name: "new" }]);
+  });
+
+  it("two tabs can sync at the same time", async ({ expect, hub }) => {
+    const syncer: Syncer = {
+      push: vi.fn(),
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue(usersAt(1, "John")),
+    };
+
+    const tabA = await buildEngine(hub.newTab(), { syncer });
+    const tabB = await buildEngine(hub.newTab(), { syncer });
+
+    await expect(Promise.all([tabA.sync(), tabB.sync()])).resolves.toBeDefined();
+    const { rows } = await tabB.sql(sql`SELECT * FROM users`);
+    expect(rows).toMatchObject([{ id: 1, name: "John" }]);
   });
 });
 

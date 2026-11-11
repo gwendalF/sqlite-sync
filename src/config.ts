@@ -55,6 +55,7 @@ export type Config<M extends MutatorsConfig = MutatorsConfig> = {
   syncer: Syncer;
   mutators: M;
   migrations?: Migration[];
+  autoSync?: boolean;
 };
 
 export type ValidatedConfig<M extends MutatorsConfig> = Config<M> & {

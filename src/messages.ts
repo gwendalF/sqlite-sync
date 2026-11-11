@@ -22,7 +22,8 @@ export type RpcMethods = {
   startMutate: { args: undefined; result: void };
   endMutate: { args: { name: string; args: unknown }; result: void };
   beginPull: { args: undefined; result: PullRequest };
-  startRebase: { args: PullResponse; result: LocalMutations };
+  /** `undefined` when the response is stale and must be ignored */
+  startRebase: { args: PullResponse; result: LocalMutations | undefined };
   endRebase: { args: number; result: void };
   query: {
     args: RustQuery;
@@ -30,10 +31,6 @@ export type RpcMethods = {
   };
   execMigration: {
     args: { userVersion: number; batch: string };
-    result: void;
-  };
-  cancelPull: {
-    args: undefined;
     result: void;
   };
   begin: { args: undefined; result: void };

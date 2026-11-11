@@ -52,7 +52,7 @@ export class SyncEngine<M extends MutatorsConfig> {
 
   private constructor(
     private plateform: Plateform,
-    config: Config<M>,
+    { autoSync = true, mutators, migrations, syncer }: Config<M>,
   ) {
     const publicMutators: Record<string, (payload: unknown) => Promise<void>> =
       {};
@@ -64,9 +64,9 @@ export class SyncEngine<M extends MutatorsConfig> {
       }
     > = {};
 
-    this.syncer = config.syncer;
+    this.syncer = syncer;
 
-    for (const [name, mut] of Object.entries(config.mutators)) {
+    for (const [name, mut] of Object.entries(mutators)) {
       let deserialize: ((payload: unknown) => unknown) | undefined = undefined;
       let fn: MutatorFn<any>;
       if (typeof mut === "object" && mut !== null) {
@@ -90,6 +90,9 @@ export class SyncEngine<M extends MutatorsConfig> {
             throw e;
           }
         });
+        if (autoSync) {
+          this.sync().catch((e) => console.error("autoSync failed", e));
+        }
       };
 
       rawMutators[name] = {
@@ -187,25 +190,31 @@ export class SyncEngine<M extends MutatorsConfig> {
       await this.push();
     } finally {
       const request = await this.call("beginPull");
-      const response = await this.syncer.pull(request).catch(async (e) => {
-        await this.call("cancelPull");
-        throw e;
-      });
+      const response = await this.syncer.pull(request);
 
       const endVersion = response.server_version;
 
       await this.plateform.lock(async () => {
         const mutations = await this.call("startRebase", response);
-        const updated = new Set<string>();
-        for (const mutation of mutations) {
-          const { fn, deserialize } = this.rawMutators[mutation.name];
-          await fn(
-            updated,
-            deserialize ? deserialize(mutation.args) : mutation.args,
-          );
+        if (!mutations) {
+          return;
         }
-        await this.call("endRebase", endVersion);
-        this.notify([...updated.keys()]);
+
+        try {
+          const updated = new Set<string>();
+          for (const mutation of mutations) {
+            const { fn, deserialize } = this.rawMutators[mutation.name];
+            await fn(
+              updated,
+              deserialize ? deserialize(mutation.args) : mutation.args,
+            );
+          }
+          await this.call("endRebase", endVersion);
+          this.notify([...updated.keys()]);
+        } catch (e) {
+          await this.call("rollback");
+          throw e;
+        }
       });
     }
   };
