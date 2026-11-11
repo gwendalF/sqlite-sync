@@ -590,6 +590,44 @@ describe("SyncEngine allow to sync", () => {
     ]); // mutation applied
   });
 
+  it("replays the pending mutations in the order they were made", async ({
+    expect,
+    hub,
+  }) => {
+    const syncer = {
+      // the server has applied none of the local mutations yet
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
+        server_version: 1,
+        last_mutation_id: 0,
+        mutations: [
+          {
+            op: "upsert",
+            table: "users",
+            pks: ["id"],
+            records: [{ id: 1, name: "server" }],
+          },
+        ],
+      }),
+      push: vi.fn(),
+    };
+
+    const engine = await buildEngine(hub.newTab(), {
+      syncer,
+      mutators: {
+        rename: async (handle: DBHandle, name: string) => {
+          await handle.sql(sql`UPDATE users SET name = ${name} WHERE id = 1`);
+        },
+      },
+    });
+
+    await engine.mutate.rename("first");
+    await engine.mutate.rename("second");
+    await engine.sync();
+
+    const { rows } = await engine.sql(sql`SELECT name FROM users`);
+    expect(rows).toEqual(["second"]);
+  });
+
   it("rolls back the rebase when a replayed mutation fails", async ({
     expect,
     hub,

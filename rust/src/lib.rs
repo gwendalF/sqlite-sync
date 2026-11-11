@@ -442,10 +442,7 @@ impl SqliteEngine {
     /// responses may arrive out of order. A response older than the state already applied is
     /// stale: nothing is done and `None` is returned, the caller must not call `end_rebasing`.
     #[wasm_bindgen]
-    pub fn start_rebasing(
-        &mut self,
-        response: JsPullResponse,
-    ) -> Result<Option<JsLocalMutations>> {
+    pub fn start_rebasing(&mut self, response: JsPullResponse) -> Result<Option<JsLocalMutations>> {
         let response: PullResponse = serde_wasm_bindgen::from_value(response.into())?;
         if response.server_version < self.server_version {
             return Ok(None);
@@ -465,7 +462,7 @@ impl SqliteEngine {
             })?;
 
         let mutations = self
-            .rever_changesets(response.last_mutation_id)
+            .revert_changesets(response.last_mutation_id)
             .map_err(|e| RollbackErr {
                 reason: e.to_string(),
                 conn: &self.connection,
@@ -623,7 +620,7 @@ impl SqliteEngine {
         }
     }
 
-    fn rever_changesets(&self, last_mutation_id: usize) -> rusqlite::Result<Vec<Mutation>> {
+    fn revert_changesets(&self, last_mutation_id: usize) -> rusqlite::Result<Vec<Mutation>> {
         let mut stmt = self.connection.prepare_cached(
             "SELECT id, name, json(args), changeset FROM pending_mutations ORDER by id DESC",
         )?;
@@ -674,6 +671,7 @@ impl SqliteEngine {
         }
 
         changes.retain(|mutation| mutation.id > last_mutation_id);
+        changes.reverse();
         Ok(changes)
     }
 
