@@ -8,6 +8,7 @@ export type {
   DBHandle,
   Migration,
   Query,
+  SyncResult,
   ValidatedConfig,
 } from "./config.ts";
 

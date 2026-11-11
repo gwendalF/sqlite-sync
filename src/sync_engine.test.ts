@@ -676,11 +676,66 @@ describe("SyncEngine allow to sync", () => {
   });
 });
 
+describe("onSync", () => {
+  const emptyPull: PullResponse = {
+    server_version: 1,
+    last_mutation_id: 0,
+    mutations: [],
+  };
+
+  it("reports a successful sync", async ({ expect, hub }) => {
+    const onSync = vi.fn();
+    const syncer: Syncer = {
+      push: vi.fn(),
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue(emptyPull),
+    };
+    const engine = await buildEngine(hub.newTab(), { syncer, onSync });
+
+    await engine.sync();
+
+    expect(onSync).toHaveBeenCalledExactlyOnceWith({ ok: true });
+  });
+
+  it("reports a failed sync, which still rejects", async ({ expect, hub }) => {
+    const onSync = vi.fn();
+    const error = new Error("offline");
+    const syncer: Syncer = {
+      push: vi.fn(),
+      pull: vi.fn<Syncer["pull"]>().mockRejectedValue(error),
+    };
+    const engine = await buildEngine(hub.newTab(), { syncer, onSync });
+
+    await expect(engine.sync()).rejects.toBe(error);
+
+    expect(onSync).toHaveBeenCalledExactlyOnceWith({ ok: false, error });
+  });
+
+  it("reports the failure of the sync started by a mutation", async ({
+    expect,
+    hub,
+  }) => {
+    const onSync = vi.fn();
+    const error = new Error("session expired");
+    const syncer: Syncer = {
+      push: vi.fn<Syncer["push"]>().mockRejectedValue(error),
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue(emptyPull),
+    };
+    const engine = await buildEngine(hub.newTab(), {
+      syncer,
+      onSync,
+      autoSync: true,
+    });
+
+    await engine.mutate.addUser("Jane");
+
+    await vi.waitFor(() =>
+      expect(onSync).toHaveBeenCalledWith({ ok: false, error }),
+    );
+  });
+});
+
 describe("concurrent syncs", () => {
-  const usersAt = (
-    server_version: number,
-    name: string,
-  ): PullResponse => ({
+  const usersAt = (server_version: number, name: string): PullResponse => ({
     server_version,
     last_mutation_id: 0,
     mutations: [
@@ -750,7 +805,9 @@ describe("concurrent syncs", () => {
     const tabA = await buildEngine(hub.newTab(), { syncer });
     const tabB = await buildEngine(hub.newTab(), { syncer });
 
-    await expect(Promise.all([tabA.sync(), tabB.sync()])).resolves.toBeDefined();
+    await expect(
+      Promise.all([tabA.sync(), tabB.sync()]),
+    ).resolves.toBeDefined();
     const { rows } = await tabB.sql(sql`SELECT * FROM users`);
     expect(rows).toMatchObject([{ id: 1, name: "John" }]);
   });

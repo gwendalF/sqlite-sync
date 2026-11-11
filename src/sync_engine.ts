@@ -8,6 +8,7 @@ import {
   Syncer,
   Query,
   MutatorFn,
+  SyncResult,
   ValidatedConfig,
 } from "./config";
 import { Method, RpcArgs } from "./messages.ts";
@@ -40,6 +41,7 @@ export class SyncEngine<M extends MutatorsConfig> {
   private tablesCache = new Map<string, string[]>();
   private listeners = new Set<Listener>();
   private syncer: Syncer;
+  private onSync: (result: SyncResult) => void;
 
   private rawMutators: Record<
     string,
@@ -52,7 +54,16 @@ export class SyncEngine<M extends MutatorsConfig> {
 
   private constructor(
     private plateform: Plateform,
-    { autoSync = true, mutators, migrations, syncer }: Config<M>,
+    {
+      autoSync = true,
+      mutators,
+      syncer,
+      onSync = (result) => {
+        if (!result.ok) {
+          console.error("syncFailed", result.error);
+        }
+      },
+    }: Config<M>,
   ) {
     const publicMutators: Record<string, (payload: unknown) => Promise<void>> =
       {};
@@ -65,6 +76,7 @@ export class SyncEngine<M extends MutatorsConfig> {
     > = {};
 
     this.syncer = syncer;
+    this.onSync = onSync;
 
     for (const [name, mut] of Object.entries(mutators)) {
       let deserialize: ((payload: unknown) => unknown) | undefined = undefined;
@@ -91,7 +103,8 @@ export class SyncEngine<M extends MutatorsConfig> {
           }
         });
         if (autoSync) {
-          this.sync().catch((e) => console.error("autoSync failed", e));
+          // nobody awaits this sync: its failure is already reported to onSync
+          this.sync().catch(() => {});
         }
       };
 
@@ -186,6 +199,16 @@ export class SyncEngine<M extends MutatorsConfig> {
   };
 
   sync = async () => {
+    try {
+      await this.pushThenPull();
+    } catch (error) {
+      this.onSync({ ok: false, error });
+      throw error;
+    }
+    this.onSync({ ok: true });
+  };
+
+  private pushThenPull = async () => {
     try {
       await this.push();
     } finally {

@@ -56,7 +56,10 @@ export type Config<M extends MutatorsConfig = MutatorsConfig> = {
   mutators: M;
   migrations?: Migration[];
   autoSync?: boolean;
+  onSync?: (result: SyncResult) => void;
 };
+
+export type SyncResult = { ok: true } | { ok: false; error: unknown };
 
 export type ValidatedConfig<M extends MutatorsConfig> = Config<M> & {
   mutators: NoInfer<ValidateMutators<M>>;
