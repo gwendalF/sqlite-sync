@@ -224,7 +224,7 @@ export class SyncEngine<M extends MutatorsConfig> {
         }
 
         try {
-          const updated = new Set<string>();
+          const updated = new Set(response.mutations.map((m) => m.table));
           for (const mutation of mutations) {
             const { fn, deserialize } = this.rawMutators[mutation.name];
             await fn(
@@ -318,8 +318,13 @@ export class SyncEngine<M extends MutatorsConfig> {
     const hit = this.tablesCache.get(sql);
     if (hit) return hit;
 
+    // a query answered by a covering index only reports the index, not its table
     const { rows } = await this.sql<string>({
-      sql: "SELECT name FROM tables_used(?) WHERE type = 'table'",
+      sql: `SELECT name FROM tables_used(?1) WHERE type = 'table'
+        UNION
+        SELECT s.tbl_name FROM tables_used(?1) AS t
+        JOIN sqlite_schema AS s ON s.type = 'index' AND s.name = t.name
+        WHERE t.type = 'index'`,
       params: [sql],
     });
     this.tablesCache.set(sql, rows);

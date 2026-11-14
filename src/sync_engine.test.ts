@@ -432,6 +432,66 @@ describe("have reactive query", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
+  it("query read from an index only is notified when its table change", async ({
+    expect,
+    hub,
+  }) => {
+    const engine = await buildEngine(hub.newTab(), {
+      migrations: [
+        {
+          version: 1,
+          run: async (db) => {
+            await db.exec(`
+              CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+              CREATE INDEX users_name ON users(name);`);
+          },
+        },
+      ],
+    });
+
+    const onChange = vi.fn();
+    await engine.reactiveQuery<string>(
+      { sql: "SELECT name FROM users WHERE name > ''" },
+      { onChange },
+    );
+
+    await engine.mutate.addUser("John Doe");
+    await hub.settle();
+    expect(onChange).toHaveBeenCalledWith(["John Doe"]);
+  });
+
+  it("query is notified when a pull writes its table", async ({
+    expect,
+    hub,
+  }) => {
+    const syncer = {
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
+        server_version: 1,
+        last_mutation_id: 0,
+        mutations: [
+          {
+            op: "upsert",
+            table: "users",
+            pks: ["id"],
+            records: [{ id: 1, name: "John Doe" }],
+          },
+        ],
+      }),
+      push: vi.fn(),
+    };
+    const engine = await buildEngine(hub.newTab(), { syncer });
+
+    const onChange = vi.fn();
+    await engine.reactiveQuery<number>(
+      { sql: "SELECT COUNT(*) FROM users" },
+      { onChange },
+    );
+
+    await engine.sync();
+    await hub.settle();
+    expect(onChange).toHaveBeenCalledWith([1]);
+  });
+
   it.for([
     ["CREATE TABLE tests(c)"],
     ["INSERT INTO users(name) VALUES ('Test')"],
