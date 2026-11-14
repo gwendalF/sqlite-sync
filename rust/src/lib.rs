@@ -518,6 +518,13 @@ impl SqliteEngine {
             reason: e.to_string(),
             conn: &self.connection,
         })?;
+        // Shadow tables (FTS5, R*Tree...) are written by their virtual table, itself
+        // fed by triggers on real tables: replaying the real tables rebuilds them.
+        let shadow_tables = self.shadow_tables().map_err(|e| RollbackErr {
+            reason: e.to_string(),
+            conn: &self.connection,
+        })?;
+        session.table_filter(Some(move |table: &str| !shadow_tables.contains(table)));
         session.attach::<&str>(None).map_err(|e| RollbackErr {
             reason: e.to_string(),
             conn: &self.connection,
@@ -620,6 +627,17 @@ impl SqliteEngine {
         }
     }
 
+    /// Tables owned by a virtual table of the main schema (`docs_fts_data`, `geo_node`...).
+    fn shadow_tables(&self) -> rusqlite::Result<std::collections::HashSet<String>> {
+        let mut stmt = self.connection.prepare_cached(
+            "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'shadow'",
+        )?;
+        let tables = stmt
+            .query_map((), |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(tables)
+    }
+
     fn revert_changesets(&self, last_mutation_id: usize) -> rusqlite::Result<Vec<Mutation>> {
         let mut stmt = self.connection.prepare_cached(
             "SELECT id, name, json(args), changeset FROM pending_mutations ORDER by id DESC",
@@ -651,11 +669,14 @@ impl SqliteEngine {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
+        // changesets recorded before shadow tables were filtered out may still hold some
+        let shadow_tables = std::sync::Arc::new(self.shadow_tables()?);
         for change in &changes {
             let mut slice: &[u8] = &change.changeset;
+            let shadow_tables = shadow_tables.clone();
             self.connection.apply_strm(
                 &mut slice,
-                Option::<fn(&str) -> bool>::None,
+                Some(move |table: &str| !shadow_tables.contains(table)),
                 // https://sqlite.org/session.html#SQLITE_CHANGESET_ABORT
                 |conflict_type, _| match conflict_type {
                     ConflictType::SQLITE_CHANGESET_DATA => ConflictAction::SQLITE_CHANGESET_REPLACE,
