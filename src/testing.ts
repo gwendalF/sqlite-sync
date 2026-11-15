@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { SqliteDB } from "./core.ts";
-import { Plateform } from "./plateform/plateform.ts";
+import { Platform } from "./platform/platform.ts";
 
 const wasm = await WebAssembly.compile(
   readFileSync(new URL("./sync_sqlite/sync_sqlite_bg.wasm", import.meta.url)),
@@ -12,7 +12,7 @@ export async function createTestHub(name = ":memory:") {
   const tabs = new Set<(tables: string[] | "*") => void>();
   const pending = new Set<Promise<void>>();
 
-  const newTab = (): Plateform => {
+  const newTab = (): Platform => {
     let me: (tables: string[] | "*") => void;
     return {
       call: async (method, ...args) => {

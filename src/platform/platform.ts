@@ -1,6 +1,6 @@
 import { Method, RpcArgs, RpcMethods } from "../messages";
 
-export interface Plateform {
+export interface Platform {
   call<K extends Method>(
     method: K,
     ...args: RpcArgs<K>

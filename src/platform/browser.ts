@@ -7,9 +7,9 @@ import type {
   WorkerResponse,
   RequestFor,
 } from "../messages";
-import { Plateform } from "./plateform";
+import { Platform } from "./platform";
 
-export type BrowserPlateformOptions = {
+export type BrowserPlatformOptions = {
   dbName: string;
   namespace?: string;
   worker?: () => Worker;
@@ -55,7 +55,7 @@ type Pending = {
   reject(e: Error): void;
 };
 
-export class BrowserPlateform implements Plateform {
+export class BrowserPlatform implements Platform {
   private inflights = new Map<
     string,
     { message: RequestFor<Method> } & Pending
@@ -79,7 +79,7 @@ export class BrowserPlateform implements Plateform {
     reactive: string;
   };
 
-  constructor(private opts: BrowserPlateformOptions) {
+  constructor(private opts: BrowserPlatformOptions) {
     if (!navigator.locks) {
       throw new Error("no navigator.locks");
     }
@@ -192,7 +192,7 @@ export class BrowserPlateform implements Plateform {
                 error: {
                   code: "RUNTIME_ERROR",
                   message:
-                    "close is not callable over rpc, use plateform.close()",
+                    "close is not callable over rpc, use platform.close()",
                 },
               } satisfies ChannelMessage);
             } else if (e.data.type === "request") {
@@ -311,7 +311,7 @@ export class BrowserPlateform implements Plateform {
     ...args: RpcArgs<M>
   ): Promise<RpcMethods[M]["result"]> => {
     if (this.closed) {
-      throw this.failure ?? new Error("plateform closed");
+      throw this.failure ?? new Error("platform closed");
     }
     return new Promise((resolve, reject) => {
       const id = crypto.randomUUID();
@@ -361,7 +361,7 @@ export class BrowserPlateform implements Plateform {
     this.rpc.close();
 
     for (const { reject } of this.inflights.values()) {
-      reject(new Error("plateform closed"));
+      reject(new Error("platform closed"));
     }
     this.inflights.clear();
   };

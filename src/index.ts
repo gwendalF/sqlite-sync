@@ -15,11 +15,11 @@ export type {
 export { defineMutators } from "./config.ts";
 
 export {
-  BrowserPlateform,
-  type BrowserPlateformOptions,
-} from "./plateform/browser.ts";
+  BrowserPlatform,
+  type BrowserPlatformOptions,
+} from "./platform/browser.ts";
 
-export type { Plateform } from "./plateform/plateform.ts";
+export type { Platform } from "./platform/platform.ts";
 export type {
   PullResponse,
   PushRequest,

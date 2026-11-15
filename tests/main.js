@@ -1,4 +1,4 @@
-import { BrowserPlateform, sql, SyncEngine } from "../dist/index.js";
+import { BrowserPlatform, sql, SyncEngine } from "../dist/index.js";
 
 const output = document.querySelector("#output");
 const dbName = document.querySelector("input");
@@ -7,12 +7,12 @@ let engine;
 document.querySelector("#start").addEventListener("click", async () => {
   output.textContent = "Loading";
   try {
-    const plateform = new BrowserPlateform({
+    const platform = new BrowserPlatform({
       dbName: dbName.value,
     });
-    await plateform.start();
+    await platform.start();
 
-    engine = await SyncEngine.create(plateform, {
+    engine = await SyncEngine.create(platform, {
       puller: {
         pull(version) {
           return {

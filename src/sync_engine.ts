@@ -12,7 +12,7 @@ import {
   ValidatedConfig,
 } from "./config";
 import { Method, RpcArgs } from "./messages.ts";
-import { Plateform } from "./plateform/plateform.ts";
+import { Platform } from "./platform/platform.ts";
 
 export type ReactiveHandlers<T> = {
   onChange: (data: T[]) => void;
@@ -53,7 +53,7 @@ export class SyncEngine<M extends MutatorsConfig> {
   mutate: PublicMutators<M>;
 
   private constructor(
-    private plateform: Plateform,
+    private platform: Platform,
     {
       autoSync = true,
       mutators,
@@ -89,7 +89,7 @@ export class SyncEngine<M extends MutatorsConfig> {
       }
 
       publicMutators[name] = async (payload) => {
-        await this.plateform.lock(async () => {
+        await this.platform.lock(async () => {
           const written = new Set<string>();
           try {
             await this.call("startMutate");
@@ -121,10 +121,10 @@ export class SyncEngine<M extends MutatorsConfig> {
   }
 
   static create = async <M extends MutatorsConfig>(
-    plateform: Plateform,
+    platform: Platform,
     config: ValidatedConfig<M>,
   ) => {
-    const engine = new SyncEngine<M>(plateform, config);
+    const engine = new SyncEngine<M>(platform, config);
     if (config.migrations?.length) {
       await engine.applyMigrations(config.migrations);
     }
@@ -160,7 +160,7 @@ export class SyncEngine<M extends MutatorsConfig> {
     const refresh = async () => {
       const currentCall = ++callNumber;
       try {
-        const rows = await this.plateform.lock(read);
+        const rows = await this.platform.lock(read);
         if (active && currentCall === callNumber) {
           handler.onChange(rows);
         }
@@ -174,7 +174,7 @@ export class SyncEngine<M extends MutatorsConfig> {
       onChange: () => void refresh(),
     };
 
-    const data = await this.plateform.lock(async () => {
+    const data = await this.platform.lock(async () => {
       const tables = await this.tablesOf(query.sql);
       const rows = await read();
       listener.tables = new Set(tables);
@@ -217,7 +217,7 @@ export class SyncEngine<M extends MutatorsConfig> {
 
       const endVersion = response.server_version;
 
-      await this.plateform.lock(async () => {
+      await this.platform.lock(async () => {
         const mutations = await this.call("startRebase", response);
         if (!mutations) {
           return;
@@ -263,7 +263,7 @@ export class SyncEngine<M extends MutatorsConfig> {
 
   private notify = (changes: string[]) => {
     this.dispatch(changes);
-    this.plateform.notifyTablesChanged(changes);
+    this.platform.notifyTablesChanged(changes);
   };
 
   private trackingHandle = (written: Set<string>): DBHandle => {
@@ -284,12 +284,12 @@ export class SyncEngine<M extends MutatorsConfig> {
     method: M,
     ...args: [...RpcArgs<M>]
   ) => {
-    return this.plateform.call(method, ...args);
+    return this.platform.call(method, ...args);
   };
 
   private applyMigrations = async (migrations: Migration[]) => {
     migrations.sort((a, b) => a.version - b.version);
-    return this.plateform.lock(async () => {
+    return this.platform.lock(async () => {
       let {
         rows: [version],
       } = await this.sql<number>({
@@ -331,7 +331,7 @@ export class SyncEngine<M extends MutatorsConfig> {
     return rows;
   };
 
-  listDababases = (): Promise<string[]> => {
+  listDatabases = (): Promise<string[]> => {
     return this.call("listDatabases");
   };
 

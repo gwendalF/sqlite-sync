@@ -1,6 +1,6 @@
-import { BrowserPlateform } from "./src/plateform/browser";
+import { BrowserPlatform } from "./src/platform/browser";
 
-const p = new BrowserPlateform({ dbName: ":memory:" });
+const p = new BrowserPlatform({ dbName: ":memory:" });
 await p.start();
 console.log("P ready");
 

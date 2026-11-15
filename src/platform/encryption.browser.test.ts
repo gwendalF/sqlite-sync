@@ -1,6 +1,6 @@
 import { describe, expect, it as itBase, vi } from "vitest";
-import { BrowserPlateform, type BrowserPlateformOptions } from "./browser";
-import type { Plateform } from "./plateform";
+import { BrowserPlatform, type BrowserPlatformOptions } from "./browser";
+import type { Platform } from "./platform";
 
 const uid = () => crypto.randomUUID();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -16,20 +16,20 @@ const POOL_ROOT = "sync-sqlite";
 const SAH_HEADER_SIZE = 4096;
 const SAH_NAME_SIZE = 512;
 
-/** The plateforms of a test, closed (and awaited) at its end. */
+/** The platforms of a test, closed (and awaited) at its end. */
 const it = itBase
   .extend("track", ({}, { onCleanup }) => {
-    const opened = new Set<Plateform>();
+    const opened = new Set<Platform>();
     onCleanup(async () => {
       await Promise.all([...opened].map((p) => p.close()));
     });
-    return <P extends Plateform>(p: P) => (opened.add(p), p);
+    return <P extends Platform>(p: P) => (opened.add(p), p);
   })
   .extend(
     "open",
     ({ track }) =>
-      async (dbName: string, o: Partial<BrowserPlateformOptions> = {}) => {
-        const p = new BrowserPlateform({ dbName, namespace: uid(), ...o });
+      async (dbName: string, o: Partial<BrowserPlatformOptions> = {}) => {
+        const p = new BrowserPlatform({ dbName, namespace: uid(), ...o });
         await p.start();
         return track(p);
       },
@@ -38,17 +38,17 @@ const it = itBase
   .extend(
     "tab",
     ({ open }) =>
-      (dbName: string, o: Partial<BrowserPlateformOptions> = {}) =>
+      (dbName: string, o: Partial<BrowserPlatformOptions> = {}) =>
         open(dbName, { namespace: dbName, ...o }),
   );
 
-const exec = (p: Plateform, sql: string, params: unknown[] = []) =>
+const exec = (p: Platform, sql: string, params: unknown[] = []) =>
   p.call("query", { sql, params, isReadonly: false });
 
-const query = async (p: Plateform, sql: string) =>
+const query = async (p: Platform, sql: string) =>
   (await p.call("query", { sql, params: [], isReadonly: true })).rows;
 
-async function writeSecret(p: Plateform) {
+async function writeSecret(p: Platform) {
   await exec(p, "CREATE TABLE secrets (v TEXT)");
   await exec(p, "INSERT INTO secrets VALUES (?)", [SECRET]);
 }
@@ -63,12 +63,14 @@ async function rawDbFile(dbName: string): Promise<Uint8Array> {
   // the terminated worker may still hold the sync access handles for a moment
   for (let attempt = 0; ; attempt++) {
     try {
-      for await (const handle of (opaque as any).values() as AsyncIterable<
-        FileSystemHandle
-      >) {
+      for await (const handle of (
+        opaque as any
+      ).values() as AsyncIterable<FileSystemHandle>) {
         if (handle.kind !== "file") continue;
         const bytes = new Uint8Array(
-          await (await (handle as FileSystemFileHandle).getFile()).arrayBuffer(),
+          await (
+            await (handle as FileSystemFileHandle).getFile()
+          ).arrayBuffer(),
         );
         if (bytes.length <= SAH_HEADER_SIZE) continue;
         const nameBytes = bytes.subarray(0, SAH_NAME_SIZE);
@@ -113,7 +115,9 @@ describe("encryption", () => {
     expect(containsText(raw, SECRET)).toBe(true);
   });
 
-  it("with a key the database file is encrypted and readable with the key", async ({ open }) => {
+  it("with a key the database file is encrypted and readable with the key", async ({
+    open,
+  }) => {
     const dbName = `${uid()}.db`;
     const p = await open(dbName, { encryptionKey: "k1" });
     await writeSecret(p);
@@ -190,9 +194,9 @@ describe("encryption", () => {
   });
 
   it("rejects a key on an in-memory database", async ({ open }) => {
-    await expect(
-      open(":memory:", { encryptionKey: "k" }),
-    ).rejects.toThrow(/in-memory/);
+    await expect(open(":memory:", { encryptionKey: "k" })).rejects.toThrow(
+      /in-memory/,
+    );
   });
 });
 
@@ -211,7 +215,9 @@ describe("several tabs", () => {
     expect(await query(follower, "SELECT v FROM secrets")).toEqual([SECRET]);
   });
 
-  it("a tab with a wrong key or without key cannot join the leader", async ({ tab }) => {
+  it("a tab with a wrong key or without key cannot join the leader", async ({
+    tab,
+  }) => {
     const dbName = `${uid()}.db`;
     const leader = await tab(dbName, { encryptionKey: "k1" });
     await writeSecret(leader);
@@ -232,12 +238,15 @@ describe("several tabs", () => {
     );
   });
 
-  it("the leader start fails on a wrong key even if a tab joins meanwhile", async ({ tab, track }) => {
+  it("the leader start fails on a wrong key even if a tab joins meanwhile", async ({
+    tab,
+    track,
+  }) => {
     const dbName = `${uid()}.db`;
     await (await tab(dbName, { encryptionKey: "k1" })).close();
 
     const leader = track(
-      new BrowserPlateform({ dbName, encryptionKey: "wrong" }),
+      new BrowserPlatform({ dbName, encryptionKey: "wrong" }),
     );
     const started = leader.start();
     // the leader holds the lock, its worker is still opening the db
@@ -249,11 +258,12 @@ describe("several tabs", () => {
     await expect(joining).resolves.toBeDefined();
   });
 
-  it("a tab joining while the leader opens the db gets answers", async ({ tab, track }) => {
+  it("a tab joining while the leader opens the db gets answers", async ({
+    tab,
+    track,
+  }) => {
     const dbName = `${uid()}.db`;
-    const leader = track(
-      new BrowserPlateform({ dbName, encryptionKey: "k1" }),
-    );
+    const leader = track(new BrowserPlatform({ dbName, encryptionKey: "k1" }));
     const started = leader.start();
     await vi.waitUntil(() => leaderHeld(dbName), { interval: 1 });
     const follower = await tab(dbName, { encryptionKey: "k1" });
@@ -263,7 +273,9 @@ describe("several tabs", () => {
     expect(await query(leader, "SELECT v FROM secrets")).toEqual([SECRET]);
   });
 
-  it("a tab taking the lead that cannot open the db rejects its calls", async ({ tab }) => {
+  it("a tab taking the lead that cannot open the db rejects its calls", async ({
+    tab,
+  }) => {
     const dbName = `${uid()}.db`;
     const leader = await tab(dbName, { encryptionKey: "k1" });
     const onError = vi.fn();

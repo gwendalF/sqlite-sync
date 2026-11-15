@@ -10,7 +10,7 @@ import {
   MutatorsConfig,
   ValidatedConfig,
 } from "./config";
-import { Plateform } from "./plateform/plateform";
+import { Platform } from "./platform/platform";
 import { createTestHub } from "./testing";
 import { SqliteDB } from "./core";
 
@@ -40,10 +40,10 @@ async function getUserVersion(core: SqliteDB): Promise<number> {
 type testMut = { addUser: MutatorFn<string> };
 
 function buildEngine<M extends MutatorsConfig = testMut>(
-  plateform: Plateform,
+  platform: Platform,
   opts?: Partial<ValidatedConfig<M>>,
 ): Promise<SyncEngine<M>> {
-  return SyncEngine.create(plateform, {
+  return SyncEngine.create(platform, {
     mutators: {
       addUser: async (handle: DBHandle, name: string) => {
         await handle.sql({

@@ -1,78 +1,247 @@
-<div align="center">
+# sync-sqlite
 
-  <h1><code>wasm-pack-template</code></h1>
+Local-first SQLite for the browser, kept in sync with your server.
 
-  <strong>A template for kick starting a Rust and WebAssembly project using <a href="https://github.com/rustwasm/wasm-pack">wasm-pack</a>.</strong>
+`sync-sqlite` runs SQLite (compiled to WebAssembly) in a Web Worker, stores the database in the
+Origin Private File System (OPFS), and synchronises it with a backend you control. Writes go
+through named **mutators**: they apply instantly to the local database, are queued, pushed to
+your server, and replayed on top of the server state after each pull (optimistic updates with
+rebase).
 
-  <h3>
-    <a href="https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/index.html">Tutorial</a>
-    <span> | </span>
-    <a href="https://discordapp.com/channels/442252698964721669/443151097398296587">Chat</a>
-  </h3>
+- **Plain SQL** – query with a `sql` tagged template, no ORM.
+- **Reactive queries** – subscribe to a query and get new rows whenever a table it reads changes,
+  including changes made in other tabs.
+- **Multi-tab** – one tab is elected leader and owns the database; the other tabs talk to it over
+  `BroadcastChannel`. Leadership moves automatically when a tab closes.
+- **Optional encryption** – the database file can be encrypted (SQLite3MultipleCiphers, ChaCha20).
+- **Migrations** – versioned with `PRAGMA user_version`.
+- **Bring your own backend** – you implement a two-method `Syncer` (`push` / `pull`).
 
-  <sub>Built with Rust and WebAssembly by <a href="https://rustwasm.github.io/">The Rust and WebAssembly Working Group</a></sub>
-</div>
+## Installation
 
-## About
-
-[Read this template tutorial][template-docs].
-
-This template is designed for compiling Rust libraries into WebAssembly and
-publishing the resulting package to NPM.
-
-Be sure to check out [other `wasm-pack` tutorials online][tutorials] for other
-templates and usages of `wasm-pack`.
-
-[tutorials]: https://rustwasm.github.io/docs/wasm-pack/tutorials/index.html
-[template-docs]: https://rustwasm.github.io/docs/wasm-pack/tutorials/npm-browser-packages/index.html
-
-## Usage
-
-### Use `wasm-pack new` to Clone this Template
-
-```
-wasm-pack new my-project
-cd my-project
+```sh
+npm install sync-sqlite
+# or
+pnpm add sync-sqlite
 ```
 
-### Build with `wasm-pack build`
+The package ships a `.wasm` file and a worker loaded with `new URL(..., import.meta.url)`, so use a
+bundler that supports that pattern (Vite, webpack 5, …). With Vite, add
+[`vite-plugin-wasm`](https://github.com/Menci/vite-plugin-wasm) (excluding the package from
+dependency pre-bundling avoids broken worker/wasm URLs):
 
-```
-wasm-pack build
-```
+```ts
+// vite.config.ts
+import wasm from "vite-plugin-wasm";
 
-### Test in Headless Browsers with `wasm-pack test`
-
-```
-wasm-pack test --headless --firefox
-```
-
-### Publish to NPM with `wasm-pack publish`
-
-```
-wasm-pack publish
+export default {
+  plugins: [wasm()],
+  optimizeDeps: { exclude: ["sync-sqlite"] },
+};
 ```
 
-## Batteries Included
+Requires a browser with OPFS, Web Locks (`navigator.locks`) and `BroadcastChannel`.
 
-* [`wasm-bindgen`](https://github.com/rustwasm/wasm-bindgen) for communicating
-  between WebAssembly and JavaScript.
-* [`console_error_panic_hook`](https://github.com/rustwasm/console_error_panic_hook)
-  for logging panic messages to the developer console.
-* `LICENSE-APACHE` and `LICENSE-MIT`: most Rust projects are licensed this way, so these are included for you.
+## Quick start
+
+```ts
+import {
+  BrowserPlatform,
+  SyncEngine,
+  defineMutators,
+  sql,
+  type Syncer,
+} from "sync-sqlite";
+
+// 1. How the client talks to your server
+const syncer: Syncer = {
+  async push(request) {
+    await fetch("/api/push", { method: "POST", body: JSON.stringify(request) });
+  },
+  async pull(request) {
+    const res = await fetch("/api/pull", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+    return res.json();
+  },
+};
+
+// 2. Every write is a named mutator. It must be deterministic: it is replayed after each pull.
+const mutators = defineMutators({
+  addTodo: async (db, todo: { id: string; title: string }) => {
+    await db.sql(
+      sql`INSERT INTO todos (id, title, done) VALUES (${todo.id}, ${todo.title}, 0)`,
+    );
+  },
+  toggleTodo: async (db, id: string) => {
+    await db.sql(sql`UPDATE todos SET done = NOT done WHERE id = ${id}`);
+  },
+});
+
+// 3. Open the database
+const platform = new BrowserPlatform({ dbName: "my-app.sqlite" });
+await platform.start();
+
+const engine = await SyncEngine.create(platform, {
+  syncer,
+  mutators,
+  migrations: [
+    {
+      version: 1,
+      run: (db) =>
+        db.exec(
+          `CREATE TABLE todos (id TEXT PRIMARY KEY, title TEXT NOT NULL, done INTEGER NOT NULL)`,
+        ),
+    },
+  ],
+});
+
+// 4. Write (local first, then synced in the background)
+await engine.mutate.addTodo({ id: crypto.randomUUID(), title: "Buy milk" });
+
+// 5. Read
+const { rows } = await engine.sql<{ id: string; title: string }>(
+  sql`SELECT * FROM todos`,
+);
+
+// 6. Or read reactively
+const { data, unlisten } = await engine.reactiveQuery<{
+  id: string;
+  title: string;
+}>(sql`SELECT * FROM todos WHERE done = 0`, {
+  onChange: (rows) => render(rows),
+});
+```
+
+## API
+
+### `new BrowserPlatform(options)` / `platform.start()`
+
+| Option          | Type                                        | Description                                                                                                      |
+| --------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `dbName`        | `string`                                    | Database file name in OPFS (`":memory:"` for an in-memory database).                                             |
+| `namespace`     | `string?`                                   | Prefix of the locks and channels used between tabs. Defaults to `dbName`.                                        |
+| `encryptionKey` | `string \| () => string \| Promise<string>` | Encrypts the database. Omitted: stored in plain text. All tabs must use the same key, otherwise `start()` fails. |
+| `onError`       | `(err: Error) => void`                      | Called if this tab becomes leader after `start()` and cannot open the database.                                  |
+
+`start()` resolves once a leader (this tab or another) has the database open. `close()` releases it.
+
+### `SyncEngine.create(platform, config)`
+
+| Config       | Type                           | Description                                                                                    |
+| ------------ | ------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `syncer`     | `Syncer`                       | Your transport to the server (see below).                                                      |
+| `mutators`   | `MutatorsConfig`               | Named write functions, usually built with `defineMutators`.                                    |
+| `migrations` | `Migration[]?`                 | `{ version, run(db) }`, applied in order, tracked with `PRAGMA user_version`.                  |
+| `autoSync`   | `boolean?` (default `true`)    | Run `sync()` after each mutation.                                                              |
+| `onSync`     | `(result: SyncResult) => void` | Called after every sync with `{ ok: true }` or `{ ok: false, error }`. Logs errors by default. |
+
+Instance methods:
+
+- `engine.mutate.<name>(payload)` – runs the mutator in a transaction, records it for push, and
+  notifies reactive queries of the tables it wrote.
+- `engine.sql<T>(query)` – read-only query, resolves to `{ rows: T[] }`.
+- `engine.reactiveQuery<T>(query, { onChange, onError? })` – resolves to `{ data, unlisten }`.
+  `onChange` is called with fresh rows when a table read by the query changes (locally, in
+  another tab, or after a pull).
+- `engine.sync()` – push pending mutations, then pull and rebase.
+- `engine.exportDatabase()` – the database file as a `Uint8Array`.
+- `engine.listDatabases()` / `engine.deleteDatabases(names)` – manage the files in OPFS.
+- `engine.close()` – remove all reactive listeners.
+
+### Mutators
+
+A mutator is `async (db, payload) => void`, where `db.sql(query)` runs any SQL statement. Payloads
+are stored and sent to the server as JSON, so their type must be JSON-safe (checked at compile
+time). For other types, give a deserializer:
+
+```ts
+defineMutators({
+  setDueDate: {
+    fn: async (db, p: { id: string; due: Date }) => {
+      /* ... */
+    },
+    deserialize: (raw: any) => ({ ...raw, due: new Date(raw.due) }),
+  },
+});
+```
+
+Mutators are re-executed when the client rebases on new server state, so they must only depend on
+their payload and the database content (no `Date.now()`, `Math.random()`, or network calls inside).
+
+### `sql` tagged template
+
+```ts
+sql`SELECT * FROM todos WHERE id = ${id}`;
+// => { sql: "SELECT * FROM todos WHERE id = ?", params: [id] }
+```
+
+Interpolated values are always bound parameters, never concatenated into the SQL.
+
+## Server protocol
+
+You implement `Syncer`:
+
+```ts
+interface Syncer {
+  push(request: PushRequest): Promise<void>;
+  pull(request: PullRequest): Promise<PullResponse>;
+}
+```
+
+**Push** – the client sends its pending mutations. The server should run the matching mutator
+logic for each one, in order, and remember the last processed `id` for that `client_id`.
+
+```ts
+type PushRequest = {
+  client_id: string;
+  mutations: { id: number; name: string; args: unknown }[];
+};
+```
+
+**Pull** – the client sends the last server version it knows; the server answers with the rows
+changed since, its current version, and the last mutation id it has applied for this client.
+
+```ts
+type PullRequest = { client_id: string; known_version: number };
+
+type PullResponse = {
+  server_version: number;
+  last_mutation_id: number;
+  mutations: {
+    op: "upsert" | "delete";
+    table: string;
+    pks: string[]; // primary key column names
+    records: Record<string, unknown>[]; // full rows for upsert, key columns for delete
+  }[];
+};
+```
+
+On pull, the client rolls back its local pending mutations, applies the server changes, drops the
+mutations the server has acknowledged (`id <= last_mutation_id`), and replays the remaining ones on
+top. Stale responses (older than the state already applied) are ignored.
+
+## Testing
+
+`sync-sqlite/testing` provides `createTestHub()` to run the engine in Node (e.g. with Vitest) with
+an in-memory database and simulated tabs:
+
+```ts
+import { createTestHub } from "sync-sqlite/testing";
+import { SyncEngine } from "sync-sqlite";
+
+const hub = await createTestHub();
+const engine = await SyncEngine.create(hub.newTab(), {
+  syncer,
+  mutators,
+  autoSync: false,
+});
+// ...
+await hub.settle(); // wait for cross-tab notifications
+```
 
 ## License
 
-Licensed under either of
-
-* Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-* MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT),
 at your option.
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in the work by you, as defined in the Apache-2.0
-license, shall be dual licensed as above, without any additional terms or
-conditions.

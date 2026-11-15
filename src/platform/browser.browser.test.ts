@@ -1,6 +1,6 @@
 import { describe, expect, it as itBase, vi } from "vitest";
-import { BrowserPlateform, type BrowserPlateformOptions } from "./browser";
-import type { Plateform } from "./plateform";
+import { BrowserPlatform, type BrowserPlatformOptions } from "./browser";
+import type { Platform } from "./platform";
 
 const uid = () => crypto.randomUUID();
 const worker = () => {
@@ -12,28 +12,28 @@ const worker = () => {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const sql = (
-  p: Plateform,
+  p: Platform,
   s: string,
   params: unknown[] = [],
   isReadonly = true,
 ) => p.call("query", { sql: s, params, isReadonly });
 
-/** The plateforms of a test, closed (and awaited) at its end. */
+/** The platforms of a test, closed (and awaited) at its end. */
 const it = itBase.extend("open", ({}, { onCleanup }) => {
-  const opened: Plateform[] = [];
+  const opened: Platform[] = [];
   onCleanup(async () => {
     await Promise.all(opened.map((p) => p.close()));
   });
-  return async (ns: string, o: Partial<BrowserPlateformOptions> = {}) => {
-    const plateform = new BrowserPlateform({
+  return async (ns: string, o: Partial<BrowserPlatformOptions> = {}) => {
+    const platform = new BrowserPlatform({
       dbName: ":memory:",
       namespace: ns,
       worker,
       ...o,
     });
-    await plateform.start();
-    opened.push(plateform);
-    return plateform;
+    await platform.start();
+    opened.push(platform);
+    return platform;
   };
 });
 
@@ -57,7 +57,7 @@ describe("call", () => {
 });
 
 describe("leader", () => {
-  it("2 plateforme : 1 leader, 1 DB", async ({ open }) => {
+  it("2 platforms : 1 leader, 1 DB", async ({ open }) => {
     const ns = uid();
     const a = await open(ns);
     const b = await open(ns);
@@ -123,7 +123,9 @@ describe("several databases", () => {
     expect((await sql(b, "SELECT x FROM t")).rows).toEqual(["b"]);
   });
 
-  it("closing a db keeps the other one open, and it can be reopened", async ({ open }) => {
+  it("closing a db keeps the other one open, and it can be reopened", async ({
+    open,
+  }) => {
     const dbA = `${uid()}.db`;
     const a = await open(uid(), { dbName: dbA });
     const b = await open(uid(), { dbName: `${uid()}.db` });
@@ -154,7 +156,7 @@ describe("several databases", () => {
 });
 
 describe("lock", () => {
-  it("exclusion between plateform and order", async ({ open }) => {
+  it("exclusion between platform and order", async ({ open }) => {
     const ns = uid();
     const a = await open(ns);
     const b = await open(ns);
@@ -222,7 +224,9 @@ describe("notifications", () => {
 });
 
 describe("open and close", () => {
-  it("tab1 close, tab2 get leader, tab3 inflights request are replayed", async ({ open }) => {
+  it("tab1 close, tab2 get leader, tab3 inflights request are replayed", async ({
+    open,
+  }) => {
     const ns = uid();
     const a = await open(ns);
     const b = await open(ns);
