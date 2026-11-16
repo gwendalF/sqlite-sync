@@ -1,6 +1,6 @@
 {
   "name": "@gwendalf/sync-sqlite",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -24,7 +24,7 @@
     "test-all": "vitest",
     "dev": "vite",
     "build-wasm": "wasm-pack build ./rust --target web --out-dir ../src/sync_sqlite --out-name sync_sqlite && pnpm vitest --clearCache",
-    "build": "pnpm build-wasm && tsc -p ./tsconfig.build.json && cp -r src/sync_sqlite dist/ && rm dist/sync_sqlite/.gitignore",
+    "build": "rm -rf dist && pnpm build-wasm && tsc -p ./tsconfig.build.json && cp -r src/sync_sqlite dist/ && rm dist/sync_sqlite/.gitignore",
     "test:e2e": "playwright test"
   },
   "keywords": [],
