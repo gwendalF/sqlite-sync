@@ -293,22 +293,11 @@ this list before shipping a backend.
 
 - **A version with "everything before V is over".** `pg_snapshot_xmin` in PostgreSQL, the event
   number with a single writer. Nothing else (see the traps below).
-- **Every write path changes the version of the row.** Triggers do it for `INSERT`, `UPDATE`,
-  `DELETE`, `COPY` and cascades, whatever the code that writes (app, admin script, migration).
-  Not covered, so plan for them:
-  - `TRUNCATE` fires no row trigger: no tombstone. After a `TRUNCATE`, move `sync_horizon` past the
-    current version so that every client resets.
-  - `session_replication_role = replica` (some restore and ETL tools) disables the triggers: same.
-  - `ALTER TABLE … ADD COLUMN … DEFAULT` fills the column without any `UPDATE`: no trigger, no
-    `sync_xid` change, clients never get the new values. Same for a value computed on read that
-    changes. Touch the rows (`UPDATE t SET sync_xid = pg_current_xact_id()`, in batches) or reset
-    the clients.
-- **A tombstone for everything that leaves the client**, not only deletions:
-  - an `UPDATE` of the primary key: the client gets the new key as an upsert and keeps the old row.
-    Write a tombstone for the old key (in the trigger, when `OLD.id <> NEW.id`) or forbid it.
-  - a row leaving the client's scope (reassigned to another user, permission removed, archived and
-    filtered out): for this client it is a deletion. Record it (a tombstone per user or per scope),
-    or the row stays on the device.
+- **Every write path changes the version of the row**, whatever the code that writes (app, admin
+  script, migration). The triggers do it for `INSERT`, `UPDATE`, `DELETE`, `COPY` and cascades;
+  see [what they miss](#what-the-triggers-miss-and-the-fix) for the rest.
+- **A tombstone for everything that leaves the client**, not only deletions: a primary key change,
+  a row leaving the client's scope (same link).
 - **A total order for the keyset**: the key ends with the primary key, and its columns are
   `NOT NULL` (a `NULL` makes the row comparison `NULL`: the row is never sent). An index matches
   `ORDER BY`.
@@ -318,6 +307,102 @@ this list before shipping a backend.
 - **Push applied once**: `last_mutation_id` checked and updated in the transaction of the mutation.
   A mutation that fails on the server must still move `last_mutation_id` (record the error),
   otherwise the client pushes it again forever.
+
+### What the triggers miss, and the fix
+
+The triggers below were checked on PGlite (PostgreSQL 17). Not run: the per-user horizon, and the
+restore of a dump (only the SQL that encodes the generation was run).
+
+**Primary key change.** The client gets the new key as an upsert and keeps the old row. Write a
+tombstone for the old key (or forbid the change). **Row leaving the client's scope** (reassigned to
+another user, archived and filtered out): for this client it is a deletion. Give the tombstones a
+scope, and send a client only the tombstones of its scopes. One trigger covers the three cases:
+
+```sql
+ALTER TABLE sync_tombstones ADD COLUMN scope int; -- e.g. the owner
+
+CREATE OR REPLACE FUNCTION sync_tombstone() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' OR OLD.id IS DISTINCT FROM NEW.id
+     OR OLD.owner_id IS DISTINCT FROM NEW.owner_id THEN
+    INSERT INTO sync_tombstones (tbl, pk, scope)
+    VALUES (TG_TABLE_NAME, jsonb_build_object('id', OLD.id), OLD.owner_id);
+  END IF;
+  RETURN NULL;
+END $$;
+
+DROP TRIGGER invoices_sync_tombstone ON invoices;
+CREATE TRIGGER invoices_sync_tombstone AFTER DELETE OR UPDATE OF id, owner_id ON invoices
+  FOR EACH ROW EXECUTE FUNCTION sync_tombstone();
+```
+
+When access changes for a whole set of rows (a user removed from a project), a tombstone per row
+is heavy: reset that user instead, with a per-user horizon checked like `sync_horizon`
+(`sync_user_horizon(user_id, purged_xid)`, set to `pg_current_xact_id()` when access is removed).
+
+**`TRUNCATE`** fires no row trigger, so no tombstone. A statement trigger makes every client
+created before it reset (clients bootstrapped after it do not):
+
+```sql
+CREATE FUNCTION sync_truncated() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE sync_horizon SET purged_xid = greatest(purged_xid, pg_current_xact_id());
+  RETURN NULL;
+END $$;
+
+CREATE TRIGGER invoices_sync_truncate AFTER TRUNCATE ON invoices
+  FOR EACH STATEMENT EXECUTE FUNCTION sync_truncated();
+```
+
+A reset makes every client download everything again: on a synced table, prefer `DELETE` (one
+tombstone per row) unless the table is emptied for good.
+
+**`session_replication_role = replica`** (logical replication subscribers, some restore and ETL
+tools) disables ordinary triggers. Mark the sync triggers `ALWAYS`:
+
+```sql
+ALTER TABLE invoices ENABLE ALWAYS TRIGGER invoices_sync_touch;
+ALTER TABLE invoices ENABLE ALWAYS TRIGGER invoices_sync_tombstone;
+ALTER TABLE invoices ENABLE ALWAYS TRIGGER invoices_sync_truncate;
+```
+
+On a logical replication subscriber that serves clients, this is also what you want: transaction
+ids are local to each server, so `sync_xid` must be set by the server the clients pull from.
+
+**`ALTER TABLE … ADD COLUMN … DEFAULT`** fills the column without any `UPDATE`: no trigger, no
+`sync_xid` change, clients never get the new values. Same for any value that changes without a
+write (computed on read, a default changed afterwards). Touch the rows, in batches to keep
+transactions short, until it updates 0 rows:
+
+```sql
+-- :since = the version read just before the migration
+UPDATE invoices SET currency = currency
+WHERE id IN (SELECT id FROM invoices WHERE sync_xid < :since ORDER BY id LIMIT 10000);
+```
+
+The no-op `UPDATE` fires the trigger, which sets `sync_xid`. For a new column only some screens
+need, a reset is simpler (`UPDATE sync_horizon SET purged_xid = pg_current_xact_id()`).
+
+**A dump restored into another cluster** (`pg_dump`/`pg_restore`, a move to another provider)
+starts again from low transaction ids: the versions clients hold mean nothing there, and they would
+miss everything written until the new ids catch up. Physical replicas, failover and `pg_upgrade`
+keep the ids and are not concerned. To make every client reset after such a restore, put a
+generation in the version you send, and bump it on restore:
+
+```sql
+ALTER TABLE sync_horizon ADD COLUMN generation int NOT NULL DEFAULT 1;
+
+-- version sent: generation in the high bits (stays below 2^53 for JSON)
+SELECT (generation::bigint << 40) + pg_snapshot_xmin(pg_current_snapshot())::text::bigint
+FROM sync_horizon;
+
+-- after a restore into another cluster
+UPDATE sync_horizon SET generation = generation + 1;
+```
+
+On a pull, split `known_version` back into `generation` (`>> 40`) and xid (low 40 bits), and
+answer `{ reset: true }` when the generation is not the current one (never for
+`known_version: 0`); use the xid part everywhere else (`sync_xid >= …`, the horizon check). This holds while transaction ids stay below 2^40, about a thousand billion.
 
 ### Ideas that look clever and lose data
 
