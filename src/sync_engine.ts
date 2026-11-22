@@ -227,10 +227,14 @@ export class SyncEngine<M extends MutatorsConfig> {
           const updated = new Set(response.mutations.map((m) => m.table));
           for (const mutation of mutations) {
             const { fn, deserialize } = this.rawMutators[mutation.name];
+            // Recapture the changeset: the replay runs on a new base, so the stored
+            // one would no longer revert what is actually in the DB on the next rebase.
+            await this.call("startCapture");
             await fn(
               updated,
               deserialize ? deserialize(mutation.args) : mutation.args,
             );
+            await this.call("endReplay", mutation.id);
           }
           await this.call("endRebase", endVersion);
           this.notify([...updated.keys()]);

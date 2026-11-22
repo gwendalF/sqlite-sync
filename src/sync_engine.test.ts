@@ -738,6 +738,120 @@ describe("SyncEngine allow to sync", () => {
     ]);
   });
 
+  it("reverts a replayed UPDATE to the new server base on the next pull", async ({
+    expect,
+    hub,
+  }) => {
+    const syncer: Syncer = {
+      push: vi.fn(),
+      // the server never acknowledges the local mutation
+      pull: vi
+        .fn<Syncer["pull"]>()
+        .mockResolvedValueOnce({
+          server_version: 1,
+          last_mutation_id: 0,
+          mutations: [
+            {
+              op: "upsert",
+              table: "users",
+              pks: ["id"],
+              records: [{ id: 1, name: "John" }],
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          server_version: 2,
+          last_mutation_id: 0,
+          mutations: [
+            {
+              op: "upsert",
+              table: "users",
+              pks: ["id"],
+              records: [{ id: 1, name: "Bob" }],
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          // incremental patch: row 1 did not change on the server
+          server_version: 3,
+          last_mutation_id: 0,
+          mutations: [
+            {
+              op: "upsert",
+              table: "users",
+              pks: ["id"],
+              records: [{ id: 2, name: "Alice" }],
+            },
+          ],
+        }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), {
+      syncer,
+      mutators: {
+        upper: async (handle: DBHandle) => {
+          await handle.sql(
+            sql`UPDATE users SET name = upper(name) WHERE id = 1`,
+          );
+        },
+      },
+    });
+
+    await engine.sync();
+    await engine.mutate.upper(); // JOHN
+    await engine.sync(); // revert -> John, server -> Bob, replay -> BOB
+    // the revert must go back to Bob, not to the John of the first base
+    await engine.sync();
+
+    const { rows } = await engine.sql(sql`SELECT * FROM users ORDER BY id`);
+    expect(rows).toMatchObject([
+      { id: 1, name: "BOB" },
+      { id: 2, name: "Alice" },
+    ]);
+  });
+
+  it("reverts the row a replayed INSERT created, not the one of the first run", async ({
+    expect,
+    hub,
+  }) => {
+    const syncer: Syncer = {
+      push: vi.fn(),
+      pull: vi
+        .fn<Syncer["pull"]>()
+        .mockResolvedValueOnce({
+          // the server takes the id the local INSERT got
+          server_version: 1,
+          last_mutation_id: 0,
+          mutations: [
+            {
+              op: "upsert",
+              table: "users",
+              pks: ["id"],
+              records: [{ id: 1, name: "server" }],
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          server_version: 2,
+          last_mutation_id: 0,
+          mutations: [],
+        }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), { syncer });
+
+    await engine.mutate.addUser("local"); // id 1
+    await engine.sync(); // replay -> id 2
+    // reverting the first run would delete the server row 1 and leave id 2 behind
+    await engine.sync();
+
+    const { rows } = await engine.sql(sql`SELECT * FROM users ORDER BY id`);
+    expect(rows).toMatchObject([
+      { id: 1, name: "server" },
+      { id: 2, name: "local" },
+    ]);
+  });
+
   it("calls sync after a mutation when autoSync is enabled", async ({
     expect,
     hub,

@@ -28,6 +28,7 @@ type TableMutation = {
 };
 
 type LocalMutation = {
+  id: number;
   name: string;
   args: unknown;
 };
