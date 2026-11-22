@@ -246,7 +246,7 @@ changed since, its current version, and the last mutation id it has applied for 
 ```ts
 type PullRequest = {
   client_id: string;
-  known_version: string | null; // as received, null: the client has nothing yet
+  version: string | null; // as received; null: the client has nothing yet
   cursor?: string; // the cursor of the previous page, sent back as received
   limit?: number; // `pullLimit`, a hint
   priority?: string[]; // tables wanted first, a hint
@@ -255,7 +255,7 @@ type PullRequest = {
 type PullResponse =
   | {
       type: "changes";
-      server_version: string; // opaque to the client
+      version: string; // opaque to the client
       last_mutation_id: number;
       mutations: TableMutation[];
       cursor?: string; // present: this response is one page, more follow
@@ -288,19 +288,19 @@ A server that answers every pull in one response needs nothing more. For large v
 sync of a new device, a client offline for months), it can split its answer in pages:
 
 - A response with a `cursor` is **partial**: the client applies its rows, stores the cursor (in the
-  database, so a reload resumes from it), keeps its `known_version` and pulls again with the cursor.
+  database, so a reload resumes from it), keeps its `version` and pulls again with the cursor.
   The cursor is opaque to the client.
-- The response without `cursor` ends the sequence: its `server_version` is stored, and the client
+- The response without `cursor` ends the sequence: its `version` is stored, and the client
   pulls once more, incrementally, from it.
 - Acknowledged mutations are not dropped until that incremental pull: a page may hold a row older
   than a mutation the server has already applied, the replay keeps the local value right meanwhile.
-- `{ type: "reset" }`: the server cannot tell what changed since `known_version` (its history is
+- `{ type: "reset" }`: the server cannot tell what changed since `version` (its history is
   purged). The client empties the tables the server has sent rows for (local-only tables are
-  kept), keeps its pending mutations and pulls everything again from `known_version: null`.
+  kept), keeps its pending mutations and pulls everything again from `version: null`.
 
 `priority` is computed by the client from the tables its mounted reactive queries read, those of
 the latest mounted query first, so what the current screen shows arrives first. It is only sent
-on the first pull of a bootstrap (`known_version: null`) and with a cursor. A server paging table by
+on the first pull of a bootstrap (`version: null`) and with a cursor. A server paging table by
 table serves the first table of `priority` it has not finished, and keeps one position per table in
 its cursor, so a change of priority pauses a table without losing or repeating rows.
 

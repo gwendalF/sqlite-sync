@@ -148,7 +148,7 @@ describe("backend without cursor", () => {
     expect(syncer.pull).toHaveBeenCalledTimes(1);
     expect(server.pulls[0]).toStrictEqual({
       client_id: expect.any(String),
-      known_version: null,
+      version: null,
     });
     await expectSameAsServer(expect, engine, server);
     expect(await pendingCount(hub)).toBe(0);
@@ -169,7 +169,7 @@ describe("malformed response", () => {
     };
     const engine = await buildEngine(hub, { syncer, onSync: () => {} });
 
-    await expect(engine.sync()).rejects.toThrow("server_version");
+    await expect(engine.sync()).rejects.toThrow("missing field `version`");
   });
 });
 
@@ -189,14 +189,14 @@ describe("partial pull", () => {
     expect(server.pulls).toHaveLength(9);
     expect(server.pulls[0]).toStrictEqual({
       client_id: expect.any(String),
-      known_version: null,
+      version: null,
       limit: 4,
     });
     for (const request of server.pulls.slice(1, 8)) {
-      expect(request.known_version).toBeNull();
+      expect(request.version).toBeNull();
       expect(request.cursor).toEqual(expect.any(String));
     }
-    expect(server.pulls[8]).toMatchObject({ known_version: "30" });
+    expect(server.pulls[8]).toMatchObject({ version: "v30" });
     expect(server.pulls[8].cursor).toBeUndefined();
     expect(await storedCursor(hub)).toBeUndefined();
   });
@@ -230,7 +230,7 @@ describe("partial pull", () => {
 
     expect(await label(engine, 1)).toBe("B");
     // the version the bootstrap started from, not the current one (31)
-    expect(server.pulls[8]).toMatchObject({ known_version: "30" });
+    expect(server.pulls[8]).toMatchObject({ version: "v30" });
     await expectSameAsServer(expect, engine, server);
   });
 
@@ -456,7 +456,7 @@ describe("partial pull", () => {
   }) => {
     const upsert = (id: number, label: string): Extract<PullResponse, { type: "changes" }> => ({
       type: "changes",
-      server_version: "50", // ignored on a page
+      version: "v50", // ignored on a page
       last_mutation_id: 0,
       mutations: [
         {
@@ -469,14 +469,14 @@ describe("partial pull", () => {
     });
     const pull = vi
       .fn<Syncer["pull"]>()
-      .mockResolvedValueOnce({ ...upsert(1, "a"), server_version: "10" })
+      .mockResolvedValueOnce({ ...upsert(1, "a"), version: "v10" })
       // offline for a while: the server pages its answer
       .mockResolvedValueOnce({ ...upsert(2, "b"), cursor: "c1" })
       .mockResolvedValueOnce({ ...upsert(3, "c"), cursor: "c2" })
-      .mockResolvedValueOnce({ ...upsert(4, "d"), server_version: "40" })
+      .mockResolvedValueOnce({ ...upsert(4, "d"), version: "v40" })
       .mockResolvedValueOnce({
         type: "changes",
-        server_version: "41",
+        version: "v41",
         last_mutation_id: 0,
         mutations: [],
       });
@@ -488,13 +488,13 @@ describe("partial pull", () => {
     await engine.sync();
     await engine.sync();
 
-    const requests = pull.mock.calls.map(([r]) => [r.known_version, r.cursor]);
+    const requests = pull.mock.calls.map(([r]) => [r.version, r.cursor]);
     expect(requests).toEqual([
       [null, undefined],
-      ["10", undefined],
-      ["10", "c1"],
-      ["10", "c2"],
-      ["40", undefined], // the catch-up after the last page
+      ["v10", undefined],
+      ["v10", "c1"],
+      ["v10", "c2"],
+      ["v40", undefined], // the catch-up after the last page
     ]);
     expect((await localRows(engine, "invoices")).map((r) => r.label)).toEqual([
       "a",
@@ -551,10 +551,10 @@ describe("reset", () => {
     await expect(engine.sync()).rejects.toThrow("push failed");
 
     const requests = server.pulls.slice(before);
-    expect(requests[0]).toMatchObject({ known_version: "30" });
+    expect(requests[0]).toMatchObject({ version: "v30" });
     expect(requests[1]).toStrictEqual({
       client_id: expect.any(String),
-      known_version: null,
+      version: null,
       limit: 4,
       priority: ["entries"],
     });
@@ -597,7 +597,7 @@ describe("reset", () => {
     await engine.sync();
 
     // 30 is older than the history: reset, then everything again
-    expect(server.pulls.map((r) => r.known_version)).toEqual([null, "30", null]);
+    expect(server.pulls.map((r) => r.version)).toEqual([null, "v30", null]);
     const { rows } = await engine.sql(sql`SELECT value FROM settings`);
     expect(rows).toEqual(["dark"]);
     await expectSameAsServer(expect, engine, server);
@@ -620,7 +620,7 @@ describe("reset", () => {
     await vi.waitFor(() => expect(release).toBeDefined());
 
     server.update("invoices", 1, { label: "newer" });
-    await engine.sync(); // known_version moves from 30 to 31
+    await engine.sync(); // the version moves from v30 to v31
     release({ type: "reset" });
     await stale;
 
@@ -638,7 +638,7 @@ describe("foreign keys", () => {
       push: vi.fn(),
       pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
         type: "changes",
-        server_version: "1",
+        version: "v1",
         last_mutation_id: 0,
         mutations: [
           {
@@ -682,7 +682,7 @@ describe("priority", () => {
   /** every row sent by the pages of the bootstrap, as `table#id` */
   const scanned = (responses: PullResponse[]) =>
     responses.flatMap((r) =>
-      r.type === "changes" && (r.cursor !== undefined || r.server_version === "30")
+      r.type === "changes" && (r.cursor !== undefined || r.version === "v30")
         ? r.mutations.flatMap((m) =>
             m.records.map((rec) => `${m.table}#${rec.id}`),
           )
@@ -730,7 +730,7 @@ describe("priority", () => {
     expect(server.pulls[0].priority).toEqual(["invoices"]);
     expect(server.pulls[1]).toStrictEqual({
       client_id: expect.any(String),
-      known_version: "30",
+      version: "v30",
     });
   });
 

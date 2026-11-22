@@ -277,12 +277,12 @@ export class SyncEngine<
 
   /** Pulls and applies one response. Resolves to `true` when another pull must follow. */
   private pullOnce = async (): Promise<boolean> => {
-    const request: PullRequest = await this.call("beginPull");
+    const request = await this.call("beginPull");
     if (this.pullLimit !== undefined) {
       request.limit = this.pullLimit;
     }
     // only where a server pages by table: incremental pulls are left unchanged
-    if (request.cursor !== undefined || request.known_version === null) {
+    if (request.cursor !== undefined || request.version === null) {
       const priority = this.priority();
       if (priority.length) {
         request.priority = priority;
@@ -299,7 +299,9 @@ export class SyncEngine<
       let changes: Changes;
       try {
         const updated = new Set(
-          response.type === "reset" ? [] : response.mutations.map((m) => m.table),
+          response.type === "reset"
+            ? []
+            : response.mutations.map((m) => m.table),
         );
         for (const mutation of mutations) {
           const { fn, deserialize } = this.rawMutators[mutation.name];
@@ -321,11 +323,11 @@ export class SyncEngine<
 
       this.notify(changes);
       await this.emitSyncState();
-      return (
+      const pullAgain =
         response.type === "reset" ||
         request.cursor !== undefined ||
-        response.cursor !== undefined
-      );
+        response.cursor !== undefined;
+      return pullAgain;
     });
   };
 
