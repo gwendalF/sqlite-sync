@@ -310,8 +310,7 @@ this list before shipping a backend.
 
 ### What the triggers miss, and the fix
 
-The SQL below was checked on PGlite (PostgreSQL 17), the restore on a simulated one (rows carrying
-another cluster's xids). Not run: the per-user horizon, and a real `pg_dump`/`pg_restore`.
+The SQL below was checked on PGlite (PostgreSQL 17), except the per-user horizon.
 
 **Primary key change.** The client gets the new key as an upsert and keeps the old row. Write a
 tombstone for the old key (or forbid the change). **Row leaving the client's scope** (reassigned to
@@ -384,35 +383,10 @@ The no-op `UPDATE` fires the trigger, which sets `sync_xid`. For a new column on
 need, a reset is simpler (`UPDATE sync_horizon SET purged_xid = pg_current_xact_id()`).
 
 **A dump restored into another cluster** (`pg_dump`/`pg_restore`, a move to another provider)
-starts again from low transaction ids: the versions clients hold mean nothing there, and they would
-miss everything written until the new ids catch up. Physical replicas, failover and `pg_upgrade`
-keep the ids and are not concerned (`xid8` itself never wraps: it is 64 bits, epoch included).
-
-Send `xid + version_offset` as the version instead of the bare xid, and after such a restore set
-the offset so that new versions start above every version sent before:
-
-```sql
-ALTER TABLE sync_horizon
-  ADD COLUMN version_offset bigint NOT NULL DEFAULT 0, -- version sent = xid + version_offset
-  ADD COLUMN restore_floor bigint NOT NULL DEFAULT 0;  -- versions <= this one must reset
-
--- version sent
-SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint + version_offset FROM sync_horizon;
-
--- 1. on the old cluster, writes stopped, just before the dump: note M
-SELECT pg_current_xact_id()::text::bigint + version_offset AS m FROM sync_horizon;
-
--- 2. on the new cluster, after the restore
-DELETE FROM sync_tombstones;                         -- every client resets anyway
-UPDATE invoices SET sync_xid = pg_current_xact_id(); -- the restored rows hold the old cluster's xids
-UPDATE sync_horizon SET restore_floor = :m,
-  version_offset = :m + 1 - pg_snapshot_xmin(pg_current_snapshot())::text::bigint;
-```
-
-On a pull, answer `{ reset: true }` when `0 < known_version <= restore_floor`, and use
-`known_version - version_offset` as the xid everywhere else (`sync_xid >= …`, the horizon check).
-Versions keep growing across restores, up to 2^53 (JSON numbers): no other limit. Without step 2's
-`UPDATE`, the restored rows keep xids larger than the new ones and come with every pull.
+starts again from lower transaction ids: the versions clients hold mean nothing there. Every client
+must start over from `known_version: 0`, and the restored rows still carry the old cluster's
+`sync_xid`. Rare, but plan it before the move. Physical replicas, failover and `pg_upgrade` keep the
+ids and are not concerned (`xid8` itself never wraps: it is 64 bits, epoch included).
 
 ### Ideas that look clever and lose data
 
