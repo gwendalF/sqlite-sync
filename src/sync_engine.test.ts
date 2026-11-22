@@ -8,6 +8,7 @@ import {
   MigrationHandle,
   MutatorFn,
   MutatorsConfig,
+  Query,
   ValidatedConfig,
 } from "./config";
 import { Platform } from "./platform/platform";
@@ -35,6 +36,11 @@ async function getUserVersion(core: SqliteDB): Promise<number> {
   });
 
   return version as number;
+}
+
+/** Writes outside any mutator, which `engine.sql` does not allow */
+function write(platform: Platform, { sql, params = [] }: Query) {
+  return platform.call("query", { sql, params, isReadonly: false });
 }
 
 type testMut = { addUser: MutatorFn<string> };
@@ -176,6 +182,23 @@ describe("SyncEngine creation", () => {
     expect(
       (await engine.sql({ sql: "SELECT * FROM users" })).rows,
     ).toMatchObject([{ id: 1, name: "John Doe" }]);
+  });
+
+  it("engine.sql rejects writes: they must go through a mutator", async ({
+    expect,
+    hub,
+  }) => {
+    const engine = await buildEngine(hub.newTab());
+
+    await expect(
+      engine.sql({
+        sql: "INSERT INTO users(name) VALUES (?)",
+        params: ["John Doe"],
+      }),
+    ).rejects.toThrow(/not read only/);
+    expect(
+      (await engine.sql({ sql: "SELECT COUNT(*) FROM users" })).rows[0],
+    ).toBe(0);
   });
 
   it("rejection on mutator does not block queued mutators", async ({
@@ -552,10 +575,11 @@ describe("SyncEngine allow to sync", () => {
       push: vi.fn(),
     };
 
-    const engine = await buildEngine(hub.newTab(), { syncer });
-    await engine.sql(
+    const tab = hub.newTab();
+    const engine = await buildEngine(tab, { syncer });
+    await write(
+      tab,
       sql`INSERT INTO users(id, name) VALUES (${1}, 'Jane'), (2, ${"John"}), (3, 'Not deleted')`,
-      false,
     );
 
     await engine.sync();
@@ -586,7 +610,8 @@ describe("SyncEngine allow to sync", () => {
       push: vi.fn(),
     };
 
-    const engine = await buildEngine(hub.newTab(), {
+    const tab = hub.newTab();
+    const engine = await buildEngine(tab, {
       syncer,
       migrations: [
         {
@@ -599,9 +624,9 @@ describe("SyncEngine allow to sync", () => {
         },
       ],
     });
-    await engine.sql(
+    await write(
+      tab,
       sql`INSERT INTO users(name,age) VALUES ('Jane', 20), (${"John"}, ${20}), ('Me', 32)`,
-      false,
     );
 
     await engine.sync();

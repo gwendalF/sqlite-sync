@@ -132,7 +132,15 @@ export class SyncEngine<M extends MutatorsConfig> {
     return engine;
   };
 
-  sql = async <T = unknown>({ sql, params = [] }: Query, isReadonly = true) => {
+  /** Read-only: writes go through mutators, so they run under the lock and are captured. */
+  sql = async <T = unknown>(query: Query) => {
+    return this.exec<T>(query, true);
+  };
+
+  private exec = async <T = unknown>(
+    { sql, params = [] }: Query,
+    isReadonly: boolean,
+  ) => {
     return this.call("query", {
       sql,
       params,
@@ -274,7 +282,7 @@ export class SyncEngine<M extends MutatorsConfig> {
     return {
       sql: async (query) => {
         const tables = await this.tablesOf(query.sql);
-        const { rows, isReadonly } = await this.sql(query, false);
+        const { rows, isReadonly } = await this.exec(query, false);
         if (!isReadonly && tables.length) {
           tables.forEach((t) => written.add(t));
         }
