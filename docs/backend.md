@@ -284,6 +284,66 @@ later. Store, for each event, the table, the key and the operation:
 - Bootstrap: read the tables by key as above, `V0` being the last event number when it starts.
 - Reset: when the journal is truncated and `V` is before its start.
 
+## Prerequisites and traps
+
+A mistake here rarely fails loudly: the client just misses a row, forever, with no error. Check
+this list before shipping a backend.
+
+### Prerequisites
+
+- **A version with "everything before V is over".** `pg_snapshot_xmin` in PostgreSQL, the event
+  number with a single writer. Nothing else (see the traps below).
+- **Every write path changes the version of the row.** Triggers do it for `INSERT`, `UPDATE`,
+  `DELETE`, `COPY` and cascades, whatever the code that writes (app, admin script, migration).
+  Not covered, so plan for them:
+  - `TRUNCATE` fires no row trigger: no tombstone. After a `TRUNCATE`, move `sync_horizon` past the
+    current version so that every client resets.
+  - `session_replication_role = replica` (some restore and ETL tools) disables the triggers: same.
+  - `ALTER TABLE … ADD COLUMN … DEFAULT` fills the column without any `UPDATE`: no trigger, no
+    `sync_xid` change, clients never get the new values. Same for a value computed on read that
+    changes. Touch the rows (`UPDATE t SET sync_xid = pg_current_xact_id()`, in batches) or reset
+    the clients.
+- **A tombstone for everything that leaves the client**, not only deletions:
+  - an `UPDATE` of the primary key: the client gets the new key as an upsert and keeps the old row.
+    Write a tombstone for the old key (in the trigger, when `OLD.id <> NEW.id`) or forbid it.
+  - a row leaving the client's scope (reassigned to another user, permission removed, archived and
+    filtered out): for this client it is a deletion. Record it (a tombstone per user or per scope),
+    or the row stays on the device.
+- **A total order for the keyset**: the key ends with the primary key, and its columns are
+  `NOT NULL` (a `NULL` makes the row comparison `NULL`: the row is never sent). An index matches
+  `ORDER BY`.
+- **The version and the rows from the same server**, the version read first. With a read replica,
+  read both on the same node (see the traps).
+- **Tombstones kept much longer than the longest pull**, with a horizon to answer `reset`.
+- **Push applied once**: `last_mutation_id` checked and updated in the transaction of the mutation.
+  A mutation that fails on the server must still move `last_mutation_id` (record the error),
+  otherwise the client pushes it again forever.
+
+### Ideas that look clever and lose data
+
+| Idea | Why it breaks | Instead |
+| --- | --- | --- |
+| A sequence or `max(sync_xid)` of the rows sent as the version | Transactions commit out of order: a row with an older number commits after the pull and is never sent (see [the pitfall](#pitfall-a-sequence-and-maxversion)) | `pg_snapshot_xmin(pg_current_snapshot())` |
+| `updated_at` (a timestamp) as the version | Same problem: `now()` is the start of the transaction, a long one commits later with an older time. Clocks of several servers also drift | `sync_xid` |
+| `sync_xid > V` | `V` is the oldest transaction still running: its rows have `sync_xid = V` | `>=`; duplicates are harmless |
+| End a paged pull with the current version ("it is more recent") | Rows changed behind the position after the start are never sent again | The version taken on the first page |
+| Take the version after reading the rows | A row committed between the read and the version is skipped | Version first |
+| `OFFSET` pagination ("simpler") | A deletion in an earlier page shifts the next ones: an unchanged row is skipped forever | Keyset on a unique key |
+| Paging on a key that is not unique (`issued_on` alone) | Rows with the same value at a page boundary are skipped | Add the primary key to the key |
+| Version from the primary, rows from a read replica | The replica lags: a row committed before the version is not there yet, and the next pull starts after it | Same node for both |
+| One transaction (`REPEATABLE READ`) held across the pages, to get a consistent snapshot | Holds `xmin` and locks for minutes, ties the client to one server, breaks on any disconnect. Not needed | Stateless pages, version kept in the cursor |
+| Session or server-side state for the cursor | Lost on restart or on another instance; the client may come back days later | Everything in the cursor |
+| Trusting the cursor | The client can send any cursor | Sign it (HMAC) if it holds anything sensitive, and check the permissions on every page, not only on the first one |
+| A cursor format changed without care on deploy | Clients in the middle of a pull send the old format | Put a format version in the cursor; on an unknown one, answer `{ reset: true }` |
+| Purging tombstones without a horizon | A client older than the purge never deletes those rows | Move `sync_horizon`, answer `reset` |
+| Upserts before deletions in one response | A row deleted then created again ends up deleted on the client | Deletions first |
+| Trusting `limit` | It is a hint from the client | Cap it on the server, also in bytes for large rows |
+| Answering `reset` to `known_version: 0` | The client resets and asks again: loop | Never `reset` a bootstrap |
+
+A long-running transaction on the database (even idle, `idle in transaction`) holds `xmin` back:
+pulls keep sending the same rows again. Nothing is lost, but watch for them
+(`idle_in_transaction_session_timeout`).
+
 ## Client side
 
 - Rows of different tables arrive in different pages: a row can be there before the row it
