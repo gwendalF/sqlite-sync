@@ -221,6 +221,11 @@ from `Vstart`. Only the rows read change:
 **Bootstrap** (`known_version: 0`, `Vstart` = `V0`): every current row, by a business key (here the
 newest invoices first, useful with `priority`). No tombstone: the client has nothing to delete.
 
+The key only walks the rows: it does not need to follow the commit order, only to be a total order
+(ending with the primary key, `NOT NULL` columns). That is the version's job: a row created or
+changed behind the position during the paging has `sync_xid >= V0` and comes with the next pull.
+Any column works, a timestamp too; one that changes often (`updated_at`) only sends more rows twice.
+
 ```sql
 SELECT id, label, issued_on FROM invoices
 WHERE (issued_on, id) < (:pos_date, :pos_id)          -- no WHERE on the first page
@@ -393,7 +398,7 @@ ids and are not concerned (`xid8` itself never wraps: it is 64 bits, epoch inclu
 | Idea | Why it breaks | Instead |
 | --- | --- | --- |
 | A sequence or `max(sync_xid)` of the rows sent as the version | Transactions commit out of order: a row with an older number commits after the pull and is never sent (see [the pitfall](#pitfall-a-sequence-and-maxversion)) | `pg_snapshot_xmin(pg_current_snapshot())` |
-| `updated_at` (a timestamp) as the version | Same problem: `now()` is the start of the transaction, a long one commits later with an older time. Clocks of several servers also drift | `sync_xid` |
+| `updated_at` (a timestamp) as the version | Same problem: `now()` is the start of the transaction, a long one commits later with an older time. Clocks of several servers also drift | `sync_xid`. As a paging key a timestamp is fine (see [Paging a pull](#paging-a-pull)) |
 | `sync_xid > V` | `V` is the oldest transaction still running: its rows have `sync_xid = V` | `>=`; duplicates are harmless |
 | End a paged pull with the current version ("it is more recent") | Rows changed behind the position after the start are never sent again | The version taken on the first page |
 | Take the version after reading the rows | A row committed between the read and the version is skipped | Version first |
