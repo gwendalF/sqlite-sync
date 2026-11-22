@@ -20,17 +20,17 @@ type PullRequest = {
   version: string | null; // as received; null: the client has nothing yet
   cursor?: string; // the cursor of the previous page, as received
   limit?: number; // rows wanted per response, a hint
-  priority?: string[]; // tables wanted first, a hint
+  priority?: string[]; // tables wanted first, a hint: ignore the names you do not serve
 };
 
 type PullResponse =
   | {
       type: "changes";
-      version: string; // opaque to the client
+      version: string; // opaque to the client; a paged pull: V0 on every page, see below
       last_mutation_id: number; // last mutation applied for this client_id
       mutations: TableMutation[]; // applied in this order
       cursor?: string; // present: this response is a page, more follow
-      progress?: { done: number; total?: number };
+      progress?: { done: number; total?: number }; // your own unit, stored as is
     }
   | { type: "reset" };
 
@@ -44,18 +44,28 @@ type TableMutation = {
 
 What the client does with a response:
 
-| Response                 | Client                                                                                                                            |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| no `cursor`              | applies the rows, stores `version`, drops the mutations up to `last_mutation_id`. If it was the last page, pulls once more. |
-| `cursor`                 | applies the rows, stores the cursor, keeps `version` and drops no mutation. Pulls again with the cursor at once.             |
-| `{ type: "reset" }`     | empties the tables the server has sent rows for (not the local-only ones), keeps its pending mutations, pulls again from `version: null`.                               |
+| Request → response                       | Client                                                                                                                                     |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| no `cursor` → no `cursor` (not paged)    | applies the rows, stores `version`, drops the mutations up to `last_mutation_id`.                                                          |
+| any → `cursor` (a page)                  | applies the rows, stores the cursor, keeps its own `version`, drops no mutation. Pulls again with the cursor at once.                     |
+| `cursor` → no `cursor` (the last page)   | applies the rows, stores `version`, drops no mutation yet. Pulls once more from `version`, without cursor: that pull drops them.          |
+| any → `{ type: "reset" }`               | empties the tables the server has sent rows for (not the local-only ones), keeps its pending mutations, pulls again from `version: null`. |
 
-Versions and the cursor are opaque to the client: never parsed nor compared, only stored and sent
-back. A response answering a request made on a state that has changed since (another version or
-cursor, after a concurrent pull) is ignored. The cursor is stored in
-the client database, so a reload or a network failure resumes from the last page applied. The
-client applies `upsert` as `INSERT … ON CONFLICT DO UPDATE` and `delete` of a missing row is a
-no-op: receiving a row twice is harmless.
+**What to put in `version`.** In a response that is not paged: the version taken before reading
+the rows (see [below](#what-a-version-means)). In a paged pull: **`V0`, the version taken on the
+first page, on every page, the last one included**. The client does not store it on the pages,
+but it checks that each page answers the same `version` as the page before it, and the last page
+is the one it stores. Never the current version, never the `version` of the request.
+
+`last_mutation_id`: send it on every response, read first (see rule 6). Only a pull that is not
+paged uses it.
+
+Versions and the cursor are opaque to the client: never parsed nor ordered, only stored, sent
+back and checked for equality between pages. A response answering a request made on a state that
+has changed since (another version or cursor, after a concurrent pull) is ignored. The cursor is
+stored in the client database, so a reload or a network failure resumes from the last page
+applied. The client applies `upsert` as `INSERT … ON CONFLICT DO UPDATE` and `delete` of a
+missing row is a no-op: receiving a row twice is harmless.
 
 `priority` is computed by the client from the tables its mounted reactive queries read (the latest
 mounted query first). It is only sent on the first pull of a bootstrap (`version: null`) and
@@ -72,7 +82,9 @@ version sent at the end is the one the bootstrap **started** from:
 
 1. First page: the server notes `V0`, its current version, and puts it in the cursor.
 2. Each page reads the current rows after its position.
-3. Last page (no `cursor`): `version: V0`, **not** the current version.
+3. Every page answers `version: V0`, the last one (no `cursor`) included, **not** the current
+   version. The client fails the sync (`ProtocolError`) when a page answers another version than
+   the page before it.
 4. The client pulls incrementally from `V0` and gets everything that changed during the bootstrap:
    updates, inserts and deletes. Some rows come twice, which is harmless.
 
@@ -93,11 +105,12 @@ The same holds for a pull in one response: the version must be taken **before** 
 
 ## What the server must guarantee
 
-1. **End a paged pull with the version taken on its first page** (`V0` for a bootstrap), never
-   the current version.
+1. **Answer the version taken on the first page of a paged pull on all its pages** (`V0` for a
+   bootstrap), the last one included, never the current version.
 2. **Answer "what changed since V"**, deletions included: keep tombstones of deleted rows. If they
    are purged and `V` is older than the purge, answer `{ type: "reset" }` (never for
-   `version: null`). Keep them much longer than a bootstrap takes.
+   `version: null` without cursor: the client fails the sync). Keep them much longer than a
+   bootstrap takes.
 3. **Page by key, never by `OFFSET`**:
    `WHERE (issued_on, id) < (:date, :id) ORDER BY issued_on DESC, id DESC LIMIT :limit`.
    With `OFFSET`, a row deleted from an earlier page shifts the next ones: a row that is never
@@ -130,7 +143,11 @@ cursor. A page can also be shared, e.g. 80% for the first table and 20% for the 
 secondary tables do not wait for the main one to finish.
 
 `progress` is optional: count the rows when the bootstrap starts (`total`) and the rows sent
-(`done`), both kept in the cursor.
+(`done`), both kept in the cursor. Any unit works (rows, events…): the client stores it and
+returns it in `syncState()`, it never computes with it.
+
+`priority` holds every table the mounted queries read, local-only and virtual (FTS) tables
+included: skip the names you do not serve.
 
 ## PostgreSQL recipe (CRUD tables)
 
@@ -284,12 +301,25 @@ transaction holds `xmin` back and makes pulls resend more rows; it never loses o
 
 When one process writes events one after the other (a SQLite backend, an append-only log), the
 sequence number of the last event is a valid version: no transaction can commit an older number
-later. Store, for each event, the table, the key and the operation:
+later. Send it as a decimal string (`"1234"`). Store, for each event, the table, the key and the
+operation:
 
-- Incremental pull from V: the events `> V` (or the rows they touched, with their current value).
-  Pages are positions in the journal: the cursor holds the position and the version to end at.
-- Bootstrap: read the tables by key as above, `V0` being the last event number when it starts.
-- Reset: when the journal is truncated and `V` is before its start.
+- **Incremental pull from V**: the events `> V` and `<= V1`, `V1` being the last event number read
+  on the first page (or the rows they touched, with their current value).
+- **Bootstrap**: either read the tables by key as above, or replay the journal from its start,
+  which is the incremental pull from `0`. A replay also sends the deletions: a client that
+  bootstraps over rows it already holds (an upgrade, a lost version) deletes the stale ones.
+- **Pages** are positions in the journal: the cursor holds `V1` and one position per table (the
+  last event of that table sent). Each page reads, for the tables in `priority` order, the events
+  of that table after its position, up to `V1`, at most `limit` in all. `limit` then counts
+  events: each gives at most one row. A table is done when it read fewer events than asked. Every
+  page answers `version: V1`.
+- **Folding**: within a page, keep the last state of each row (an upsert or a delete, never both).
+  Across pages, the client applies them in order: a row created on one page and deleted on a later
+  one ends deleted.
+- **Reset**: when the journal is truncated and `V` is before its start, when `V` or a position of
+  the cursor is after the last event (a database restored from a backup), or when the cursor
+  cannot be read.
 
 ## Prerequisites and traps
 
@@ -402,7 +432,8 @@ ids and are not concerned (`xid8` itself never wraps: it is 64 bits, epoch inclu
 | A sequence or `max(sync_xid)` of the rows sent as the version | Transactions commit out of order: a row with an older number commits after the pull and is never sent (see [the pitfall](#pitfall-a-sequence-and-maxversion)) | `pg_snapshot_xmin(pg_current_snapshot())` |
 | `updated_at` (a timestamp) as the version | Same problem: `now()` is the start of the transaction, a long one commits later with an older time. Clocks of several servers also drift | `sync_xid`. As a paging key a timestamp is fine (see [Paging a pull](#paging-a-pull)) |
 | `sync_xid > V` | `V` is the oldest transaction still running: its rows have `sync_xid = V` | `>=`; duplicates are harmless |
-| End a paged pull with the current version ("it is more recent") | Rows changed behind the position after the start are never sent again | The version taken on the first page |
+| End a paged pull with the current version ("it is more recent") | Rows changed behind the position after the start are never sent again | The version taken on the first page, on every page. The client fails the sync when a page changes it |
+| Any `version` on the pages ("the client ignores it") | The client checks that every page answers the same version, the last one included | `V0` on every page |
 | Take the version after reading the rows | A row committed between the read and the version is skipped | Version first |
 | `OFFSET` pagination ("simpler") | A deletion in an earlier page shifts the next ones: an unchanged row is skipped forever | Keyset on a unique key |
 | Paging on a key that is not unique (`issued_on` alone) | Rows with the same value at a page boundary are skipped | Add the primary key to the key |
@@ -414,7 +445,8 @@ ids and are not concerned (`xid8` itself never wraps: it is 64 bits, epoch inclu
 | Purging tombstones without a horizon | A client older than the purge never deletes those rows | Move `sync_horizon`, answer `reset` |
 | Upserts before deletions in one response | A row deleted then created again ends up deleted on the client | Deletions first |
 | Trusting `limit` | It is a hint from the client | Cap it on the server, also in bytes for large rows |
-| Answering `reset` to `version: null` | The client resets and asks again: loop | Never `reset` a bootstrap |
+| Answering `reset` to `version: null` | The client resets and asks again: loop. It fails the sync instead | Never `reset` a bootstrap, except an unreadable cursor: the next pull has none |
+| Answering the cursor that was sent | The client pulls the same page forever. It fails the sync instead | Move the position, or end the pull |
 
 A long-running transaction on the database (even idle, `idle in transaction`) holds `xmin` back:
 pulls keep sending the same rows again. Nothing is lost, but watch for them

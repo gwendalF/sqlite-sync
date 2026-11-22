@@ -157,7 +157,8 @@ Instance methods:
   response, `sync()` pulls every page, then once more to catch up (see [Partial pulls](#partial-pulls)).
 - `engine.syncState()` – resolves to `{ isBootstrapping, progress? }`, see below.
 - `engine.onSyncStateChange(cb)` – calls `cb` with the sync state after each pull response this
-  engine applies (each page included). Returns the function that removes it.
+  engine applies (each page included). Only the pulls of this tab call it: another tab reads
+  `syncState()` when its reactive queries change. Returns the function that removes it.
 - `engine.exportDatabase()` – the database file as a `Uint8Array`.
 - `engine.listDatabases()` / `engine.deleteDatabases(names)` – manage the files in OPFS.
 - `engine.close()` – remove all reactive listeners.
@@ -249,17 +250,17 @@ type PullRequest = {
   version: string | null; // as received; null: the client has nothing yet
   cursor?: string; // the cursor of the previous page, sent back as received
   limit?: number; // `pullLimit`, a hint
-  priority?: string[]; // tables wanted first, a hint
+  priority?: string[]; // tables wanted first, a hint: ignore the names you do not serve
 };
 
 type PullResponse =
   | {
       type: "changes";
-      version: string; // opaque to the client
-      last_mutation_id: number;
+      version: string; // opaque to the client; on a paged pull: the version of its first page, on every page
+      last_mutation_id: number; // last mutation applied for client_id
       mutations: TableMutation[];
       cursor?: string; // present: this response is one page, more follow
-      progress?: { done: number; total?: number };
+      progress?: { done: number; total?: number }; // in your own unit, stored as is
     }
   | { type: "reset" };
 
@@ -273,9 +274,9 @@ type TableMutation = {
 
 On pull, the client rolls back its local pending mutations, applies the server changes, drops the
 mutations the server has acknowledged (`id <= last_mutation_id`), and replays the remaining ones on
-top. Versions are opaque: the client stores them and sends them back, never compares them. A
-response to a request made on a state that has changed since (another version or cursor, after a
-concurrent pull) is ignored; the next pull gets its changes.
+top. Versions are opaque: the client stores them and sends them back, never parses nor orders
+them. A response to a request made on a state that has changed since (another version or cursor,
+after a concurrent pull) is ignored; the next pull gets its changes.
 
 Mutations stay pending, and are pushed again, until a pull acknowledges them: the server must skip
 the ids it has already processed for this `client_id`.
@@ -292,17 +293,26 @@ sync of a new device, a client offline for months), it can split its answer in p
   The cursor is opaque to the client.
 - The response without `cursor` ends the sequence: its `version` is stored, and the client
   pulls once more, incrementally, from it.
+- **`version` is the same on every page of a sequence: the version the server took before
+  reading the first page** (`V0`), never its current version. The client only stores the one of
+  the last page, but that one must be `V0`: the rows changed during the paging, behind the
+  position, are only sent by the pull from `V0`. A last page answering a newer version loses
+  them for good, without any error. See [what a version means](docs/backend.md#what-a-version-means).
 - Acknowledged mutations are not dropped until that incremental pull: a page may hold a row older
   than a mutation the server has already applied, the replay keeps the local value right meanwhile.
+- `last_mutation_id` is sent on every response, but only a pull that neither sends nor receives a
+  cursor drops mutations with it.
 - `{ type: "reset" }`: the server cannot tell what changed since `version` (its history is
-  purged). The client empties the tables the server has sent rows for (local-only tables are
-  kept), keeps its pending mutations and pulls everything again from `version: null`.
+  purged), or cannot read the cursor. The client empties the tables the server has sent rows for
+  (local-only tables are kept), keeps its pending mutations and pulls everything again from
+  `version: null`. Never answer it to `version: null` without a cursor: the client would loop.
 
 `priority` is computed by the client from the tables its mounted reactive queries read, those of
-the latest mounted query first, so what the current screen shows arrives first. It is only sent
-on the first pull of a bootstrap (`version: null`) and with a cursor. A server paging table by
-table serves the first table of `priority` it has not finished, and keeps one position per table in
-its cursor, so a change of priority pauses a table without losing or repeating rows.
+the latest mounted query first, so what the current screen shows arrives first. It holds every
+table they read, local-only and virtual tables included: ignore the names you do not serve. It is
+only sent on the first pull of a bootstrap (`version: null`) and with a cursor. A server paging
+table by table serves the first table of `priority` it has not finished, and keeps one position
+per table in its cursor, so a change of priority pauses a table without losing or repeating rows.
 
 Each page is applied like a normal pull (in one transaction, with the pending mutations replayed
 on top) and notifies the reactive queries, so the data shows up page by page. Pushes keep working
@@ -316,11 +326,56 @@ const { isBootstrapping, progress } = await engine.syncState();
 // progress: the last `progress` sent by the server, if any
 ```
 
-Use it to show a banner, or to mark totals and dashboards as provisional. Rows of different tables
-arrive in different pages, so a row can be there before the row it references: prefer `LEFT JOIN`
-and a placeholder ("syncing…") in the UI. Foreign keys are only checked at the end of each page
-(`PRAGMA defer_foreign_keys`), so a strict foreign key still fails when its target comes in a
-later page.
+Use it to show a banner, or to mark totals and dashboards as provisional. `progress` is stored and
+returned as the server sent it: `done` and `total` are in the unit the server counts (rows,
+events…), the client never computes with them.
+
+Rows of different tables arrive in different pages, so a row can be there before the row it
+references: prefer `LEFT JOIN` and a placeholder ("syncing…") in the UI. Foreign keys are only
+checked at the end of each page (`PRAGMA defer_foreign_keys`), so a strict foreign key still fails
+when its target comes in a later page.
+
+### A misbehaving server
+
+A mistake in a backend rarely fails loudly: the client misses a row, forever. As a best effort,
+the client checks what it can see and fails the sync with a `ProtocolError`, without applying the
+response, when the server:
+
+- answers `{ type: "reset" }` to `version: null` without cursor (the client would bootstrap again
+  forever);
+- answers with a `cursor` the cursor it was sent (the pull would never end);
+- answers a page with another `version` than the page before it, the last page included (the
+  rows changed during the paging would be lost).
+
+The sync keeps failing, as long as the server answers the same way. The version is only checked
+between pages the same engine applies one after the other: not across a reload, nor when another
+tab applied the page before. None of this replaces the rules of [docs/backend.md](docs/backend.md).
+
+## Upgrading from 0.1.2
+
+0.1.3 changed the pull protocol: `known_version` (a number) became `version` (an opaque string or
+`null`), `server_version` became `version`, and the response has a `type`. Update the server and
+the client together; an old client cannot read the new responses, so make it update (its pulls
+fail, its database is kept).
+
+Since versions are no longer numbers, the number the client stored is not reused: **the first pull
+after the upgrade sends `version: null` on a database that already holds rows**. A bootstrap only
+upserts, so a row deleted on the server since the last pull of the client stays on it, unless:
+
+- the server bootstrap also sends the deletions (an event journal replayed from its start does), or
+- a migration shipped with the upgrade empties the synced tables. The pending mutations are kept
+  and replayed on top of the bootstrap:
+
+```ts
+migrations: [
+  // ...
+  { version: 7, run: (db) => db.exec("DELETE FROM todos; DELETE FROM projects;") },
+],
+```
+
+From 0.1.1, also: since 0.1.2 `engine.sql` only reads (a write fails with `operation is not read
+only`) and takes `{ committed? }` instead of a boolean. Write through mutators, or local mutators
+for local-only tables; in tests, seed rows through the platform.
 
 ## Testing
 

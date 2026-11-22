@@ -17,17 +17,26 @@ type PullRequest = {
   cursor?: string;
   /** Maximum number of rows the client wants in one response. A hint, see `Config.pullLimit`. */
   limit?: number;
-  /** Tables the client wants first during a partial pull. A hint the server may ignore. */
+  /**
+   * Tables the client wants first during a partial pull: every table read by its mounted
+   * queries, local-only ones included. A hint: ignore the names you do not serve.
+   */
   priority?: string[];
 };
 
+/** In the unit the server counts (rows, events…): the client only stores it. */
 type PullProgress = { done: number; total?: number };
 
 type PullResponse =
   | {
       type: "changes";
-      /** Opaque to the client: stored, sent back as is in the next request, never compared. */
+      /**
+       * Opaque to the client: stored and sent back as is, never parsed nor ordered.
+       * In a paged pull, every page answers the version the server took on the first page,
+       * the last page included: only the last one is stored, the client checks they match.
+       */
       version: string;
+      /** Last mutation applied for `client_id`: only used on a pull that is not paged. */
       last_mutation_id: number;
       mutations: TableMutation[];
       /**
