@@ -2,6 +2,9 @@
 
 Local-first SQLite for the browser, kept in sync with your server.
 
+> The latest documentation is on [GitHub](https://github.com/gwendalF/sqlite-sync#readme): the
+> README shipped with the package is the one of its version.
+
 `sync-sqlite` runs SQLite (compiled to WebAssembly) in a Web Worker, stores the database in the
 Origin Private File System (OPFS), and synchronises it with a backend you control. Writes go
 through named **mutators**: they apply instantly to the local database, are queued, pushed to
@@ -283,7 +286,7 @@ the ids it has already processed for this `client_id`.
 
 ### Partial pulls
 
-See [docs/backend.md](docs/backend.md) for what the server must guarantee, and a PostgreSQL recipe.
+See [docs/backend.md](https://github.com/gwendalF/sqlite-sync/blob/main/docs/backend.md) for what the server must guarantee, and a PostgreSQL recipe.
 
 A server that answers every pull in one response needs nothing more. For large volumes (the first
 sync of a new device, a client offline for months), it can split its answer in pages:
@@ -297,7 +300,7 @@ sync of a new device, a client offline for months), it can split its answer in p
   reading the first page** (`V0`), never its current version. The client only stores the one of
   the last page, but that one must be `V0`: the rows changed during the paging, behind the
   position, are only sent by the pull from `V0`. A last page answering a newer version loses
-  them for good, without any error. See [what a version means](docs/backend.md#what-a-version-means).
+  them for good, without any error. See [what a version means](https://github.com/gwendalF/sqlite-sync/blob/main/docs/backend.md#what-a-version-means).
 - Acknowledged mutations are not dropped until that incremental pull: a page may hold a row older
   than a mutation the server has already applied, the replay keeps the local value right meanwhile.
 - `last_mutation_id` is sent on every response, but only a pull that neither sends nor receives a
@@ -349,7 +352,7 @@ response, when the server:
 
 The sync keeps failing, as long as the server answers the same way. The version is only checked
 between pages the same engine applies one after the other: not across a reload, nor when another
-tab applied the page before. None of this replaces the rules of [docs/backend.md](docs/backend.md).
+tab applied the page before. None of this replaces the rules of [docs/backend.md](https://github.com/gwendalF/sqlite-sync/blob/main/docs/backend.md).
 
 ## Upgrading from 0.1.2
 

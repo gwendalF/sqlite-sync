@@ -30,6 +30,11 @@
   "keywords": [],
   "author": "",
   "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gwendalF/sqlite-sync.git"
+  },
+  "homepage": "https://github.com/gwendalF/sqlite-sync#readme",
   "devEngines": {
     "packageManager": {
       "name": "pnpm",
