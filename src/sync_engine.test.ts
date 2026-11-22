@@ -1114,3 +1114,102 @@ describe("sql function", () => {
     expect(query()).toMatchObject({ sql, params });
   });
 });
+
+describe("local mutators", () => {
+  const settingsEngine = (platform: Platform, syncer: Syncer = stubSyncer) =>
+    SyncEngine.create(platform, {
+      syncer,
+      autoSync: false,
+      mutators: {
+        addUser: async (db: DBHandle, name: string) => {
+          await db.sql(sql`INSERT INTO users(name) VALUES (${name})`);
+        },
+      },
+      localMutators: {
+        setTheme: async (db: DBHandle, theme: string) => {
+          await db.sql(
+            sql`INSERT OR REPLACE INTO settings(key, value) VALUES ('theme', ${theme})`,
+          );
+        },
+        failAfterWrite: async (db: DBHandle) => {
+          await db.sql(
+            sql`INSERT OR REPLACE INTO settings(key, value) VALUES ('theme', 'lost')`,
+          );
+          throw new Error("abort");
+        },
+      },
+      migrations: [
+        {
+          version: 1,
+          run: async (db: MigrationHandle) => {
+            await db.exec(
+              `CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+               CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT);`,
+            );
+          },
+        },
+      ],
+    });
+
+  const theme = sql`SELECT value FROM settings WHERE key = 'theme'`;
+
+  it("writes and notifies reactive queries, without recording a mutation", async ({
+    expect,
+    hub,
+  }) => {
+    const tab = hub.newTab();
+    const engine = await settingsEngine(tab);
+    const onChange = vi.fn();
+    await engine.reactiveQuery<string>(theme, { onChange });
+
+    await engine.local.setTheme("dark");
+    await hub.settle();
+
+    expect(onChange).toHaveBeenLastCalledWith(["dark"]);
+    const request = await tab.call("pushRequest");
+    expect(request.mutations).toEqual([]);
+  });
+
+  it("is rolled back when it throws", async ({ expect, hub }) => {
+    const engine = await settingsEngine(hub.newTab());
+    await engine.local.setTheme("dark");
+
+    await expect(engine.local.failAfterWrite()).rejects.toThrow("abort");
+    expect((await engine.sql(theme)).rows).toEqual(["dark"]);
+  });
+
+  it("survives a rebase acknowledging a pending mutation", async ({
+    expect,
+    hub,
+  }) => {
+    const push = vi.fn<Syncer["push"]>();
+    const syncer: Syncer = {
+      push,
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValueOnce({
+        server_version: 1,
+        last_mutation_id: 1,
+        mutations: [
+          {
+            op: "upsert",
+            table: "users",
+            pks: ["id"],
+            records: [{ id: 1, name: "John" }],
+          },
+        ],
+      }),
+    };
+    const engine = await settingsEngine(hub.newTab(), syncer);
+
+    await engine.mutate.addUser("John");
+    await engine.local.setTheme("dark");
+    await engine.sync();
+
+    expect(push.mock.calls[0][0].mutations).toMatchObject([
+      { name: "addUser" },
+    ]);
+    expect((await engine.sql(theme)).rows).toEqual(["dark"]);
+    expect((await engine.sql(sql`SELECT name FROM users`)).rows).toEqual([
+      "John",
+    ]);
+  });
+});

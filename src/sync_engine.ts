@@ -1,6 +1,7 @@
 import {
   Config,
   DBHandle,
+  LocalMutatorsConfig,
   Migration,
   MigrationHandle,
   MutatorsConfig,
@@ -37,7 +38,10 @@ export function sql(
   };
 }
 
-export class SyncEngine<M extends MutatorsConfig> {
+export class SyncEngine<
+  M extends MutatorsConfig,
+  L extends LocalMutatorsConfig = {},
+> {
   private tablesCache = new Map<string, string[]>();
   private listeners = new Set<Listener>();
   private syncer: Syncer;
@@ -51,19 +55,22 @@ export class SyncEngine<M extends MutatorsConfig> {
     }
   >;
   mutate: PublicMutators<M>;
+  /** Writes to local-only tables: never pushed, reverted or replayed. */
+  local: PublicMutators<L>;
 
   private constructor(
     private platform: Platform,
     {
       autoSync = true,
       mutators,
+      localMutators,
       syncer,
       onSync = (result) => {
         if (!result.ok) {
           console.error("syncFailed", result.error);
         }
       },
-    }: Config<M>,
+    }: Config<M, L>,
   ) {
     const publicMutators: Record<string, (payload: unknown) => Promise<void>> =
       {};
@@ -118,13 +125,35 @@ export class SyncEngine<M extends MutatorsConfig> {
 
     this.mutate = publicMutators as unknown as PublicMutators<M>;
     this.rawMutators = rawMutators;
+
+    const local: Record<string, (payload: unknown) => Promise<void>> = {};
+    for (const [name, fn] of Object.entries(localMutators ?? {})) {
+      // Same as a mutation, without the session: nothing is recorded for push.
+      local[name] = (payload) =>
+        this.platform.lock(async () => {
+          const written = new Set<string>();
+          try {
+            await this.call("begin");
+            await fn(this.trackingHandle(written), payload);
+            await this.call("commit");
+          } catch (e) {
+            await this.call("rollback");
+            throw e;
+          }
+          this.notify([...written.keys()]);
+        });
+    }
+    this.local = local as unknown as PublicMutators<L>;
   }
 
-  static create = async <M extends MutatorsConfig>(
+  static create = async <
+    M extends MutatorsConfig,
+    L extends LocalMutatorsConfig = {},
+  >(
     platform: Platform,
-    config: ValidatedConfig<M>,
+    config: ValidatedConfig<M, L>,
   ) => {
-    const engine = new SyncEngine<M>(platform, config);
+    const engine = new SyncEngine<M, L>(platform, config);
     if (config.migrations?.length) {
       await engine.applyMigrations(config.migrations);
     }
