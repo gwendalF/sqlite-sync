@@ -191,6 +191,32 @@ SELECT id, label, … FROM invoices WHERE sync_xid >= :v;                  -- 5.
 **Bootstrap page**: `V0` is taken (step 3) on the first page and kept in the cursor; each page runs
 the keyset query of its table; the last page answers `server_version: V0`.
 
+**Large incremental pull** (a client offline for a long time, or the catch-up after a bootstrap
+that took long): page it like a bootstrap. On the first page take `V1` (step 3) and put `V`, `V1`
+and the positions in the cursor; each page reads the window `[V, V1)` by key:
+
+```sql
+-- tombstones first, all of them, then each table
+SELECT tbl, pk, sync_xid FROM sync_tombstones
+WHERE sync_xid >= :v AND sync_xid < :v1 AND (sync_xid, pk::text) > (:pos_xid, :pos_pk)
+ORDER BY sync_xid, pk::text LIMIT :limit;
+
+SELECT id, label, …, sync_xid FROM invoices
+WHERE sync_xid >= :v AND sync_xid < :v1 AND (sync_xid, id) > (:pos_xid, :pos_id)
+ORDER BY sync_xid, id LIMIT :limit;
+```
+
+The last page answers `server_version: V1`, never the current version; the client then pulls once
+more from `V1`. The window is stable: every transaction older than `V1` is over, so no row enters
+it. A row changed or deleted during the paging leaves it (its new `sync_xid`, or its tombstone, is
+`>= V1`) and comes with the next pull. Each round only carries what changed during the previous
+one, so the rounds shrink until one response is enough.
+
+- Send **every** tombstone of the window before the rows: a row deleted then created again has a
+  tombstone older than the row, the delete must come first.
+- Check the horizon on **each** page (step 2): if tombstones of the window were purged meanwhile,
+  answer `{ reset: true }`.
+
 **Purge** the tombstones after N days and move the horizon past them:
 
 ```sql
