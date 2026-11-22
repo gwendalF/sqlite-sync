@@ -78,12 +78,20 @@ while the bootstrap is still running. The incremental pull from `V0` (taken befo
 Had the server ended the bootstrap with its current version (after 10:05), the client would keep A
 forever.
 
-The same holds for any pull: the version must be taken **before** the rows are read (or in the same
-snapshot). A row written meanwhile is then sent again next time, never missed.
+Nothing here is specific to the bootstrap. **Any pull can be paged with the same rule**: take a
+version `Vstart` before the first page, page by a stable key, end with `Vstart`, and the client pulls
+again from `Vstart`. The bootstrap is the case `known_version: 0` (all rows, no tombstone); an
+incremental pull too large for one response (a client offline for months, or the catch-up after a
+long bootstrap) is the case `known_version: V` (rows and tombstones written since `V`). See
+[Paging a pull](#paging-a-pull) for both.
+
+The same holds for a pull in one response: the version must be taken **before** the rows are read
+(or in the same snapshot). A row written meanwhile is then sent again next time, never missed.
 
 ## What the server must guarantee
 
-1. **End a bootstrap with `V0`**, the version it started from, never the current version.
+1. **End a paged pull with the version taken on its first page** (`V0` for a bootstrap), never
+   the current version.
 2. **Answer "what changed since V"**, deletions included: keep tombstones of deleted rows. If they
    are purged and `V` is older than the purge, answer `{ reset: true }` (never for
    `known_version: 0`). Keep them much longer than a bootstrap takes.
@@ -91,13 +99,13 @@ snapshot). A row written meanwhile is then sent again next time, never missed.
    `WHERE (issued_on, id) < (:date, :id) ORDER BY issued_on DESC, id DESC LIMIT :limit`.
    With `OFFSET`, a row deleted from an earlier page shifts the next ones: a row that is never
    changed is skipped, and no incremental pull will ever send it. A row whose key changes during
-   the bootstrap may move across the position: it is either sent twice or sent by the incremental
-   pull (it was written after `V0`), never lost.
-4. **Put everything in the cursor**: `V0` and the position of each table. No session, no lock, no
+   the paging may move across the position: it is either sent twice or sent by the next pull (it
+   was written after the start version), never lost.
+4. **Put everything in the cursor**: the start version and the position of each table. No session, no lock, no
    transaction held between pages. Any server instance can answer any page, the client can pause
    for days.
 5. **Skip mutations already applied.** A mutation is pushed again until a pull acknowledges it, and
-   during a bootstrap no pull acknowledges anything: compare its `id` with the last one stored for
+   during a paged pull no page acknowledges anything: compare its `id` with the last one stored for
    the `client_id`.
 6. **Read `last_mutation_id` first**, then the version, then the rows: a mutation acknowledged by
    the response is then in its rows.
@@ -131,7 +139,7 @@ deletions are kept in a tombstone table.
 ALTER TABLE invoices
   ADD COLUMN sync_xid xid8 NOT NULL DEFAULT pg_current_xact_id();
 CREATE INDEX invoices_sync_xid ON invoices (sync_xid);
-CREATE INDEX invoices_keyset ON invoices (issued_on DESC, id DESC); -- pages of the bootstrap
+CREATE INDEX invoices_keyset ON invoices (issued_on DESC, id DESC); -- pages of a bootstrap
 
 CREATE FUNCTION sync_touch() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -188,35 +196,6 @@ SELECT tbl, pk FROM sync_tombstones WHERE sync_xid >= :v;                -- 4. d
 SELECT id, label, … FROM invoices WHERE sync_xid >= :v;                  -- 5. then each table
 ```
 
-**Bootstrap page**: `V0` is taken (step 3) on the first page and kept in the cursor; each page runs
-the keyset query of its table; the last page answers `server_version: V0`.
-
-**Large incremental pull** (a client offline for a long time, or the catch-up after a bootstrap
-that took long): page it like a bootstrap. On the first page take `V1` (step 3) and put `V`, `V1`
-and the positions in the cursor; each page reads the window `[V, V1)` by key:
-
-```sql
--- tombstones first, all of them, then each table
-SELECT tbl, pk, sync_xid FROM sync_tombstones
-WHERE sync_xid >= :v AND sync_xid < :v1 AND (sync_xid, pk::text) > (:pos_xid, :pos_pk)
-ORDER BY sync_xid, pk::text LIMIT :limit;
-
-SELECT id, label, …, sync_xid FROM invoices
-WHERE sync_xid >= :v AND sync_xid < :v1 AND (sync_xid, id) > (:pos_xid, :pos_id)
-ORDER BY sync_xid, id LIMIT :limit;
-```
-
-The last page answers `server_version: V1`, never the current version; the client then pulls once
-more from `V1`. The window is stable: every transaction older than `V1` is over, so no row enters
-it. A row changed or deleted during the paging leaves it (its new `sync_xid`, or its tombstone, is
-`>= V1`) and comes with the next pull. Each round only carries what changed during the previous
-one, so the rounds shrink until one response is enough.
-
-- Send **every** tombstone of the window before the rows: a row deleted then created again has a
-  tombstone older than the row, the delete must come first.
-- Check the horizon on **each** page (step 2): if tombstones of the window were purged meanwhile,
-  answer `{ reset: true }`.
-
 **Purge** the tombstones after N days and move the horizon past them:
 
 ```sql
@@ -231,6 +210,53 @@ WHERE EXISTS (SELECT FROM purged);
 
 `xid8` is a 64-bit integer; it is sent as a JSON number, exact while it stays below 2^53 (an epoch
 below 2^21). Send it as text in the cursor.
+
+### Paging a pull
+
+The same rule for every pull too large for one response: on the first page take `Vstart` (step 3)
+and put it in the cursor with the positions; each page reads by key after its position; the last
+page answers `server_version: Vstart`, never the current version; the client then pulls once more
+from `Vstart`. Only the rows read change:
+
+**Bootstrap** (`known_version: 0`, `Vstart` = `V0`): every current row, by a business key (here the
+newest invoices first, useful with `priority`). No tombstone: the client has nothing to delete.
+
+```sql
+SELECT id, label, issued_on FROM invoices
+WHERE (issued_on, id) < (:pos_date, :pos_id)          -- no WHERE on the first page
+ORDER BY issued_on DESC, id DESC LIMIT :limit;
+```
+
+**Incremental pull from `V`** (`Vstart` = `V1`): the rows and tombstones of the window `[V, V1)`,
+by `(sync_xid, key)`. Tombstones first, all of them, then each table:
+
+```sql
+SELECT tbl, pk, sync_xid FROM sync_tombstones
+WHERE sync_xid >= :v AND sync_xid < :v1 AND (sync_xid, pk::text) > (:pos_xid, :pos_pk)
+ORDER BY sync_xid, pk::text LIMIT :limit;
+
+SELECT id, label, …, sync_xid FROM invoices
+WHERE sync_xid >= :v AND sync_xid < :v1 AND (sync_xid, id) > (:pos_xid, :pos_id)
+ORDER BY sync_xid, id LIMIT :limit;
+```
+
+Example: a client comes back after three months, `known_version: 5000`. The server takes
+`V1 = 9000`, sends the window `[5000, 9000)` in 40 pages, the last one answering `9000`. Meanwhile
+other users made 300 changes (`sync_xid >= 9000`): the next pull, from `9000`, sends them in one
+response.
+
+Why it works:
+
+- No row enters a window: every transaction older than `Vstart` is over. A row changed or deleted
+  during the paging leaves it (its new `sync_xid`, or its tombstone, is `>= Vstart`) and comes with
+  the next pull. During a bootstrap, a row created or changed behind the position comes the same
+  way (its `sync_xid` is `>= V0`).
+- Each round only carries what changed during the previous one, so the rounds shrink until one
+  response is enough.
+- Tombstones go before the rows: a row deleted then created again has a tombstone older than the
+  row, the delete must come first.
+- Check the horizon on **each** page of an incremental pull (step 2): if tombstones of the window
+  were purged meanwhile, answer `{ reset: true }`.
 
 ### Pitfall: a sequence and `max(version)`
 
