@@ -3,6 +3,7 @@ import type {
   PullRequest,
   PullResponse,
   PushRequest,
+  SyncState as RustSyncState,
 } from "./sync_sqlite/sync_sqlite.js";
 
 export type ErrorCode = "INITIALISATION_NOT_DONE" | "RUNTIME_ERROR";
@@ -23,8 +24,12 @@ export type RpcMethods = {
   endMutate: { args: { name: string; args: unknown }; result: void };
   beginPull: { args: undefined; result: PullRequest };
   /** `undefined` when the response is stale and must be ignored */
-  startRebase: { args: PullResponse; result: LocalMutations | undefined };
-  endRebase: { args: number; result: void };
+  startRebase: {
+    args: { request: PullRequest; response: PullResponse };
+    result: LocalMutations | undefined;
+  };
+  endRebase: { args: undefined; result: void };
+  syncState: { args: undefined; result: SyncState };
   startCapture: { args: undefined; result: void };
   endReplay: { args: number; result: void };
   query: {
@@ -46,6 +51,17 @@ export type RpcMethods = {
   rekey: { args: string | null; result: void };
 };
 export type Method = keyof RpcMethods;
+
+export type SyncState = {
+  /**
+   * A partial pull is in progress, or its last page was applied but not yet the
+   * incremental pull that catches up with the changes made meanwhile: the local data
+   * is incomplete and may be behind the server (aggregates are provisional).
+   */
+  isBootstrapping: boolean;
+  /** As last reported by the server, if it does. */
+  progress?: RustSyncState["progress"];
+};
 
 export type RpcHandlers = {
   [M in Method]: (

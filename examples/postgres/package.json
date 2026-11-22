@@ -1,0 +1,12 @@
+{
+  "name": "sync-sqlite-example-postgres",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node demo.mjs"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.17",
+    "@gwendalf/sync-sqlite": "link:../.."
+  }
+}

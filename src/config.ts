@@ -82,6 +82,11 @@ export type Config<
   migrations?: Migration[];
   autoSync?: boolean;
   onSync?: (result: SyncResult) => void;
+  /**
+   * Maximum number of rows wanted in one pull response, sent to the server as
+   * `limit`. Only a hint: a server that pages its responses (`cursor`) decides.
+   */
+  pullLimit?: number;
 };
 
 export type SyncResult = { ok: true } | { ok: false; error: unknown };

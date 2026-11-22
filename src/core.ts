@@ -5,15 +5,22 @@ import {
   RpcMethods,
   RustQuery,
 } from "./messages.ts";
-import init, { PullResponse, SqliteEngine } from "./sync_sqlite/sync_sqlite.js";
+import init, { SqliteEngine } from "./sync_sqlite/sync_sqlite.js";
 
 const makeHandlers = (engine: SqliteEngine): RpcHandlers => ({
   startMutate: () => engine.start_mutate(),
   endMutate: ({ name, args: payload }) =>
     engine.end_mutate(name, JSON.stringify(payload)),
   beginPull: () => engine.begin_pull(),
-  endRebase: (version: number) => engine.end_rebasing(version),
-  startRebase: (response: PullResponse) => engine.start_rebasing(response),
+  endRebase: () => engine.end_rebasing(),
+  startRebase: ({ request, response }) =>
+    engine.start_rebasing(request, response),
+  syncState: () => {
+    const { is_bootstrapping, progress } = engine.sync_state();
+    return progress
+      ? { isBootstrapping: is_bootstrapping, progress }
+      : { isBootstrapping: is_bootstrapping };
+  },
   startCapture: () => engine.start_capture(),
   endReplay: (id: number) => engine.end_replay(id),
   query: (query: RustQuery) => {

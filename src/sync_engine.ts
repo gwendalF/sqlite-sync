@@ -13,8 +13,9 @@ import {
   SyncResult,
   ValidatedConfig,
 } from "./config";
-import { Method, RpcArgs } from "./messages.ts";
+import { Method, RpcArgs, SyncState } from "./messages.ts";
 import { Platform } from "./platform/platform.ts";
+import type { PullRequest } from "./sync_sqlite/sync_sqlite.js";
 
 export type ReactiveHandlers<T> = {
   onChange: (data: T[]) => void;
@@ -22,6 +23,9 @@ export type ReactiveHandlers<T> = {
 };
 
 type Listener = { tables: Set<string>; onChange(): void };
+
+/** Every table: sent after a reset, which empties them all. */
+type Changes = string[] | "*";
 
 export function sql(
   strings: TemplateStringsArray,
@@ -47,6 +51,8 @@ export class SyncEngine<
   private listeners = new Set<Listener>();
   private syncer: Syncer;
   private onSync: (result: SyncResult) => void;
+  private pullLimit: number | undefined;
+  private syncStateListeners = new Set<(state: SyncState) => void>();
 
   private rawMutators: Record<
     string,
@@ -66,6 +72,7 @@ export class SyncEngine<
       mutators,
       localMutators,
       syncer,
+      pullLimit,
       onSync = (result) => {
         if (!result.ok) {
           console.error("syncFailed", result.error);
@@ -85,6 +92,7 @@ export class SyncEngine<
 
     this.syncer = syncer;
     this.onSync = onSync;
+    this.pullLimit = pullLimit;
 
     for (const [name, mut] of Object.entries(mutators)) {
       let deserialize: ((payload: unknown) => unknown) | undefined = undefined;
@@ -261,37 +269,103 @@ export class SyncEngine<
     try {
       await this.push();
     } finally {
-      const request = await this.call("beginPull");
-      const response = await this.syncer.pull(request);
+      // a partial response is followed by the next page, and the last page by an
+      // incremental pull catching up with the changes made since the first one
+      while (await this.pullOnce()) {}
+    }
+  };
 
-      const endVersion = response.server_version;
+  /** Pulls and applies one response. Resolves to `true` when another pull must follow. */
+  private pullOnce = async (): Promise<boolean> => {
+    const request: PullRequest = await this.call("beginPull");
+    if (this.pullLimit !== undefined) {
+      request.limit = this.pullLimit;
+    }
+    // only where a server pages by table: incremental pulls are left unchanged
+    if (request.cursor !== undefined || request.known_version === 0) {
+      const priority = this.priority();
+      if (priority.length) {
+        request.priority = priority;
+      }
+    }
+    const response = await this.syncer.pull(request);
+    const reset = "reset" in response && response.reset === true;
 
-      await this.platform.lock(async () => {
-        const mutations = await this.call("startRebase", response);
-        if (!mutations) {
-          return;
+    return this.platform.lock(async () => {
+      const mutations = await this.call("startRebase", { request, response });
+      if (!mutations) {
+        return false;
+      }
+
+      let changes: Changes;
+      try {
+        const updated = new Set(
+          "mutations" in response ? response.mutations.map((m) => m.table) : [],
+        );
+        for (const mutation of mutations) {
+          const { fn, deserialize } = this.rawMutators[mutation.name];
+          // Recapture the changeset: the replay runs on a new base, so the stored
+          // one would no longer revert what is actually in the DB on the next rebase.
+          await this.call("startCapture");
+          await fn(
+            updated,
+            deserialize ? deserialize(mutation.args) : mutation.args,
+          );
+          await this.call("endReplay", mutation.id);
         }
+        await this.call("endRebase");
+        changes = reset ? "*" : [...updated.keys()];
+      } catch (e) {
+        await this.call("rollback");
+        throw e;
+      }
 
-        try {
-          const updated = new Set(response.mutations.map((m) => m.table));
-          for (const mutation of mutations) {
-            const { fn, deserialize } = this.rawMutators[mutation.name];
-            // Recapture the changeset: the replay runs on a new base, so the stored
-            // one would no longer revert what is actually in the DB on the next rebase.
-            await this.call("startCapture");
-            await fn(
-              updated,
-              deserialize ? deserialize(mutation.args) : mutation.args,
-            );
-            await this.call("endReplay", mutation.id);
-          }
-          await this.call("endRebase", endVersion);
-          this.notify([...updated.keys()]);
-        } catch (e) {
-          await this.call("rollback");
-          throw e;
-        }
-      });
+      this.notify(changes);
+      await this.emitSyncState();
+      return (
+        reset ||
+        request.cursor !== undefined ||
+        ("cursor" in response && response.cursor !== undefined)
+      );
+    });
+  };
+
+  /**
+   * Tables read by the mounted reactive queries, those of the latest mounted first:
+   * what the screen shows now is wanted first during a partial pull.
+   */
+  private priority = (): string[] => {
+    const tables = new Set<string>();
+    for (const listener of [...this.listeners].reverse()) {
+      for (const table of listener.tables) tables.add(table);
+    }
+    return [...tables];
+  };
+
+  /** Whether the local data is still being bootstrapped, see `SyncState`. */
+  syncState = (): Promise<SyncState> => {
+    return this.platform.lock(() => this.call("syncState"));
+  };
+
+  /**
+   * Calls `cb` after each pull response this engine applies (each page of a partial
+   * pull included). Returns the function that removes it.
+   */
+  onSyncStateChange = (cb: (state: SyncState) => void): (() => void) => {
+    this.syncStateListeners.add(cb);
+    return () => this.syncStateListeners.delete(cb);
+  };
+
+  private emitSyncState = async () => {
+    if (this.syncStateListeners.size === 0) return;
+    const state = await this.call("syncState");
+    for (const cb of this.syncStateListeners) {
+      try {
+        cb(state);
+      } catch (e) {
+        // the page is committed: a failing listener must not fail the sync
+        console.error("onSyncStateChange listener failed", e);
+      }
     }
   };
 
@@ -302,19 +376,18 @@ export class SyncEngine<
 
   close = () => {
     this.listeners.clear();
+    this.syncStateListeners.clear();
   };
 
-  private dispatch = (changes: string[]) => {
+  private dispatch = (changes: Changes) => {
     for (const l of this.listeners) {
-      for (const table of changes) {
-        if (l.tables.has(table)) {
-          l.onChange();
-        }
+      if (changes === "*" || changes.some((table) => l.tables.has(table))) {
+        l.onChange();
       }
     }
   };
 
-  private notify = (changes: string[]) => {
+  private notify = (changes: Changes) => {
     this.dispatch(changes);
     this.platform.notifyTablesChanged(changes);
   };

@@ -18,6 +18,14 @@ pub enum WasmError {
     Other(String),
 }
 
+impl std::fmt::Display for WasmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WasmError::Sql(s) | WasmError::Serde(s) | WasmError::Other(s) => f.write_str(s),
+        }
+    }
+}
+
 impl From<WasmError> for wasm_bindgen::JsValue {
     fn from(value: WasmError) -> Self {
         match value {
@@ -70,6 +78,9 @@ extern "C" {
 
     #[wasm_bindgen(typescript_type = "PushRequest")]
     pub type JsPushRequest;
+
+    #[wasm_bindgen(typescript_type = "SyncState")]
+    pub type JsSyncState;
 
     #[wasm_bindgen(js_namespace = console)]
     fn log(s: &str);
@@ -126,8 +137,20 @@ pub struct SqliteEngine {
     connection: Pin<Box<rusqlite::Connection>>,
     pool: Option<sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil>,
     server_version: usize,
+    /// Cursor of the partial pull in progress, as last committed.
+    cursor: Option<String>,
     push_state: PushState,
 }
+
+/// Keys of the `config` table holding the pull state.
+const SERVER_VERSION: &str = "server_version";
+const PULL_CURSOR: &str = "pull_cursor";
+const PULL_PROGRESS: &str = "pull_progress";
+/// Set from the first partial page until the incremental pull that follows the last one.
+const BOOTSTRAPPING: &str = "bootstrapping";
+
+/// Tables the server has written to (JSON array): what a reset empties, local tables are kept.
+const SYNCED_TABLES: &str = "synced_tables";
 
 #[derive(Serialize)]
 pub struct SqlOutput {
@@ -139,13 +162,41 @@ pub struct SqlOutput {
 pub struct PullRequest {
     client_id: String,
     known_version: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+}
+
+/// The part of the request a response answers, to detect stale responses.
+#[derive(Deserialize)]
+pub struct PullRequestEcho {
+    known_version: usize,
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct PullResponse {
+    #[serde(default)]
     server_version: usize,
+    #[serde(default)]
     last_mutation_id: usize,
+    #[serde(default)]
     mutations: Vec<TableMutation>,
+    /// Present on a partial response: pull again with it.
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    progress: Option<serde_json::Value>,
+    /// The server cannot answer from `known_version`: drop the replicated data.
+    #[serde(default)]
+    reset: bool,
+}
+
+#[derive(Serialize)]
+pub struct SyncState {
+    is_bootstrapping: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -271,29 +322,61 @@ impl SqliteEngine {
             err => err?,
         };
 
-        let id: i64 = match conn.query_row_and_then(
-            "SELECT value FROM config WHERE key = 'server_version'",
-            (),
-            |row| row.get(0),
-        ) {
-            Ok(version) => version,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                conn.execute(
-                    "INSERT INTO config (key, value) VALUES (?, ?)",
-                    params!["server_version", 0],
-                )?;
-                0
-            }
-            err => err?,
-        };
+        conn.execute(
+            "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+            params![SERVER_VERSION, 0],
+        )?;
+        let (server_version, cursor) = Self::read_pull_state(&conn)?;
 
         Ok(SqliteEngine {
             client_id,
             connection: Box::pin(conn),
             pool,
-            server_version: id as usize,
+            server_version,
+            cursor,
             push_state: PushState::Idle,
         })
+    }
+
+    fn read_pull_state(conn: &rusqlite::Connection) -> rusqlite::Result<(usize, Option<String>)> {
+        let version: i64 = conn.query_row(
+            "SELECT value FROM config WHERE key = ?",
+            (SERVER_VERSION,),
+            |row| row.get(0),
+        )?;
+        let cursor = Self::config_get::<String>(conn, PULL_CURSOR)?;
+        Ok((version as usize, cursor))
+    }
+
+    fn config_get<T: rusqlite::types::FromSql>(
+        conn: &rusqlite::Connection,
+        key: &str,
+    ) -> rusqlite::Result<Option<T>> {
+        let mut stmt = conn.prepare_cached("SELECT value FROM config WHERE key = ?")?;
+        match stmt.query_row((key,), |row| row.get(0)) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `None` deletes the key.
+    fn config_set(&self, key: &str, value: Option<rusqlite::types::Value>) -> rusqlite::Result<()> {
+        match value {
+            Some(value) => {
+                let mut stmt = self.connection.prepare_cached(
+                    "INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                )?;
+                stmt.execute(params![key, value])?;
+            }
+            None => {
+                let mut stmt = self
+                    .connection
+                    .prepare_cached("DELETE FROM config WHERE key = ?")?;
+                stmt.execute((key,))?;
+            }
+        }
+        Ok(())
     }
 
     #[wasm_bindgen]
@@ -432,6 +515,7 @@ impl SqliteEngine {
         let request = PullRequest {
             known_version: self.server_version,
             client_id: self.client_id.clone(),
+            cursor: self.cursor.clone(),
         };
 
         let js_req = request.serialize(&serializer)?;
@@ -439,53 +523,39 @@ impl SqliteEngine {
     }
 
     /// Pulls can run concurrently (several tabs, or several syncs of the same tab), so their
-    /// responses may arrive out of order. A response older than the state already applied is
-    /// stale: nothing is done and `None` is returned, the caller must not call `end_rebasing`.
+    /// responses may arrive out of order. A stale response (answering a request made on a
+    /// state that has moved since, or older than the state already applied) is ignored:
+    /// nothing is done and `None` is returned, the caller must not call `end_rebasing`.
+    ///
+    /// A response with a `cursor` is one page of a partial pull: its rows are applied but
+    /// `server_version` is kept, the cursor is stored to resume from it. Acknowledged
+    /// mutations are only purged by a pull that is not part of a partial pull: a page may
+    /// hold a row older than a mutation the server has already applied.
     #[wasm_bindgen]
-    pub fn start_rebasing(&mut self, response: JsPullResponse) -> Result<Option<JsLocalMutations>> {
+    pub fn start_rebasing(
+        &mut self,
+        request: JsPullRequest,
+        response: JsPullResponse,
+    ) -> Result<Option<JsLocalMutations>> {
+        let request: PullRequestEcho = serde_wasm_bindgen::from_value(request.into())?;
         let response: PullResponse = serde_wasm_bindgen::from_value(response.into())?;
-        if response.server_version < self.server_version {
+        if request.cursor != self.cursor {
+            return Ok(None);
+        }
+        let partial = response.cursor.is_some();
+        if response.reset || partial {
+            if request.known_version != self.server_version {
+                return Ok(None);
+            }
+        } else if response.server_version < self.server_version {
             return Ok(None);
         }
 
-        let mut stmt = self.connection.prepare_cached("BEGIN")?;
-        stmt.execute(())?;
-
-        let mut stmt = self
-            .connection
-            .prepare_cached("UPDATE config SET value = ? WHERE key = 'server_version'")?;
-
-        stmt.execute((response.server_version as i64,))
-            .map_err(|e| RollbackErr {
-                reason: e.to_string(),
-                conn: &self.connection,
-            })?;
-
-        let mutations = self
-            .revert_changesets(response.last_mutation_id)
-            .map_err(|e| RollbackErr {
-                reason: e.to_string(),
-                conn: &self.connection,
-            })?;
-
-        self.apply_server_state(response.mutations)
-            .map_err(|e| RollbackErr {
-                reason: e.to_string(),
-                conn: &self.connection,
-            })?;
-
-        let mut stmt = self
-            .connection
-            .prepare_cached("DELETE FROM pending_mutations WHERE id <= ?")
-            .map_err(|e| RollbackErr {
-                reason: e.to_string(),
-                conn: &self.connection,
-            })?;
-        stmt.execute((response.last_mutation_id as i64,))
-            .map_err(|e| RollbackErr {
-                reason: e.to_string(),
-                conn: &self.connection,
-            })?;
+        self.connection.prepare_cached("BEGIN")?.execute(())?;
+        let mutations = self.rebase_on(&request, response).map_err(|e| RollbackErr {
+            reason: e.to_string(),
+            conn: &self.connection,
+        })?;
 
         let response: Vec<_> = mutations
             .into_iter()
@@ -504,11 +574,113 @@ impl SqliteEngine {
         Ok(Some(response.into()))
     }
 
-    #[wasm_bindgen]
-    pub fn end_rebasing(&mut self, server_version: usize) -> Result<()> {
-        self.connection.execute("COMMIT", ())?;
-        self.server_version = server_version;
+    /// Reverts the pending mutations and writes the response, in the open transaction.
+    /// Returns the mutations to replay.
+    fn rebase_on(&self, request: &PullRequestEcho, response: PullResponse) -> Result<Vec<Mutation>> {
+        use rusqlite::types::Value;
+
+        // a page may hold a row before the row it references
+        self.connection.execute("PRAGMA defer_foreign_keys = ON", ())?;
+
+        let purge = !response.reset && request.cursor.is_none() && response.cursor.is_none();
+        let last_mutation_id = if purge { response.last_mutation_id } else { 0 };
+        let mutations = self.revert_changesets(last_mutation_id)?;
+
+        if response.reset {
+            self.clear_replicated_tables()?;
+            self.config_set(SERVER_VERSION, Some(Value::Integer(0)))?;
+            self.config_set(PULL_CURSOR, None)?;
+            self.config_set(PULL_PROGRESS, None)?;
+            self.config_set(BOOTSTRAPPING, None)?;
+            return Ok(mutations);
+        }
+
+        self.record_synced_tables(&response.mutations)?;
+        self.apply_server_state(response.mutations)?;
+
+        match response.cursor {
+            Some(cursor) => {
+                self.config_set(PULL_CURSOR, Some(Value::Text(cursor)))?;
+                self.config_set(BOOTSTRAPPING, Some(Value::Integer(1)))?;
+            }
+            None => {
+                self.config_set(PULL_CURSOR, None)?;
+                self.config_set(
+                    SERVER_VERSION,
+                    Some(Value::Integer(response.server_version as i64)),
+                )?;
+            }
+        }
+
+        if purge {
+            self.config_set(PULL_PROGRESS, None)?;
+            self.config_set(BOOTSTRAPPING, None)?;
+            let mut stmt = self
+                .connection
+                .prepare_cached("DELETE FROM pending_mutations WHERE id <= ?")?;
+            stmt.execute((last_mutation_id as i64,))?;
+        } else if let Some(progress) = response.progress {
+            let progress = serde_json::to_string(&progress).map_err(|e| WasmError::Serde(e.to_string()))?;
+            self.config_set(PULL_PROGRESS, Some(Value::Text(progress)))?;
+        }
+
+        Ok(mutations)
+    }
+
+    fn synced_tables(&self) -> Result<std::collections::BTreeSet<String>> {
+        match Self::config_get::<String>(&self.connection, SYNCED_TABLES)? {
+            Some(json) => serde_json::from_str(&json).map_err(|e| WasmError::Serde(e.to_string())),
+            None => Ok(Default::default()),
+        }
+    }
+
+    fn record_synced_tables(&self, mutations: &[TableMutation]) -> Result<()> {
+        let mut tables = self.synced_tables()?;
+        let before = tables.len();
+        tables.extend(mutations.iter().map(|m| m.table.clone()));
+        if tables.len() != before {
+            let json = serde_json::to_string(&tables).map_err(|e| WasmError::Serde(e.to_string()))?;
+            self.config_set(SYNCED_TABLES, Some(rusqlite::types::Value::Text(json)))?;
+        }
         Ok(())
+    }
+
+    /// Empties the tables the server has written to. Local-only tables are kept.
+    fn clear_replicated_tables(&self) -> Result<()> {
+        let mut sql = String::new();
+        for table in self.synced_tables()? {
+            sql.clear();
+            sql.push_str("DELETE FROM ");
+            Self::push_ident(&mut sql, &table);
+            self.connection.execute(&sql, ())?;
+        }
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn end_rebasing(&mut self) -> Result<()> {
+        self.connection.execute("COMMIT", ())?;
+        let (server_version, cursor) = Self::read_pull_state(&self.connection)?;
+        self.server_version = server_version;
+        self.cursor = cursor;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn sync_state(&self) -> Result<JsSyncState> {
+        let is_bootstrapping = self.cursor.is_some()
+            || Self::config_get::<i64>(&self.connection, BOOTSTRAPPING)?.is_some();
+        let progress = match Self::config_get::<String>(&self.connection, PULL_PROGRESS)? {
+            Some(p) => Some(serde_json::from_str(&p).map_err(|e| WasmError::Serde(e.to_string()))?),
+            None => None,
+        };
+        let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+        let state = SyncState {
+            is_bootstrapping,
+            progress,
+        }
+        .serialize(&serializer)?;
+        Ok(state.into())
     }
 
     #[wasm_bindgen]

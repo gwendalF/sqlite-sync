@@ -1,0 +1,25 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      '@electric-sql/pglite':
+        specifier: ^0.5.17
+        version: 0.5.17
+      '@gwendalf/sync-sqlite':
+        specifier: link:../..
+        version: link:../..
+
+packages:
+
+  '@electric-sql/pglite@0.5.17':
+    resolution: {integrity: sha512-8SvKjiUjaU+0O0dbxjOfN+jXz14TEqDWbwDkYOW1aQ11y/ph2JvFVI27ABBo5nfw+ZfSqy4hKCNlbnbB1TDE+g==}
+
+snapshots:
+
+  '@electric-sql/pglite@0.5.17': {}

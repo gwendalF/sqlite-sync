@@ -1,7 +1,7 @@
 import { describe, test as baseTest, vi } from "vitest";
 import { sql, SyncEngine } from "./sync_engine";
 import { Syncer } from "./syncer";
-import { PullResponse } from "./sync_sqlite/sync_sqlite";
+import { TableMutation } from "./sync_sqlite/sync_sqlite";
 import {
   DBHandle,
   MigrationHandle,
@@ -16,7 +16,7 @@ const it = baseTest.extend("hub", async () => {
 });
 
 type Doc = { id: number; title: string; body: string };
-type Mutation = PullResponse["mutations"][number];
+type Mutation = TableMutation;
 
 /** `'delete'` command: the only way to remove a row from a table which does not store its content */
 const DELETE_COMMAND = `INSERT INTO docs_fts(docs_fts, rowid, title, body)

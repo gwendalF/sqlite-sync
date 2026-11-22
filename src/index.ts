@@ -23,8 +23,11 @@ export {
 } from "./platform/browser.ts";
 
 export type { Platform } from "./platform/platform.ts";
+export type { SyncState } from "./messages.ts";
 export type {
   PullResponse,
   PushRequest,
   PullRequest,
+  PullProgress,
+  TableMutation,
 } from "./sync_sqlite/sync_sqlite.js";

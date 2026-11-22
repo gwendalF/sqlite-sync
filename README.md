@@ -138,6 +138,7 @@ const { data, unlisten } = await engine.reactiveQuery<{
 | `migrations`    | `Migration[]?`                 | `{ version, run(db) }`, applied in order, tracked with `PRAGMA user_version`.                  |
 | `autoSync`      | `boolean?` (default `true`)    | Run `sync()` after each mutation.                                                              |
 | `onSync`        | `(result: SyncResult) => void` | Called after every sync with `{ ok: true }` or `{ ok: false, error }`. Logs errors by default. |
+| `pullLimit`     | `number?`                      | Maximum number of rows wanted per pull response, sent as `limit`. A hint for servers that page their responses (see [Partial pulls](#partial-pulls)). |
 
 Instance methods:
 
@@ -152,7 +153,11 @@ Instance methods:
 - `engine.reactiveQuery<T>(query, { onChange, onError? })` – resolves to `{ data, unlisten }`.
   `onChange` is called with fresh rows when a table read by the query changes (locally, in
   another tab, or after a pull).
-- `engine.sync()` – push pending mutations, then pull and rebase.
+- `engine.sync()` – push pending mutations, then pull and rebase. When the server pages its
+  response, `sync()` pulls every page, then once more to catch up (see [Partial pulls](#partial-pulls)).
+- `engine.syncState()` – resolves to `{ isBootstrapping, progress? }`, see below.
+- `engine.onSyncStateChange(cb)` – calls `cb` with the sync state after each pull response this
+  engine applies (each page included). Returns the function that removes it.
 - `engine.exportDatabase()` – the database file as a `Uint8Array`.
 - `engine.listDatabases()` / `engine.deleteDatabases(names)` – manage the files in OPFS.
 - `engine.close()` – remove all reactive listeners.
@@ -256,6 +261,72 @@ type PullResponse = {
 On pull, the client rolls back its local pending mutations, applies the server changes, drops the
 mutations the server has acknowledged (`id <= last_mutation_id`), and replays the remaining ones on
 top. Stale responses (older than the state already applied) are ignored.
+
+Mutations stay pending, and are pushed again, until a pull acknowledges them: the server must skip
+the ids it has already processed for this `client_id`.
+
+### Partial pulls
+
+See [docs/backend.md](docs/backend.md) for what the server must guarantee, and a PostgreSQL recipe.
+
+Optional: a server that answers every pull in one response needs nothing more. For large volumes
+(the first sync of a new device, a client offline for months), the server can split its answer in
+pages:
+
+```ts
+type PullRequest = {
+  client_id: string;
+  known_version: number;
+  cursor?: string; // the cursor of the previous page, sent back as received
+  limit?: number; // `pullLimit`, a hint
+  priority?: string[]; // tables wanted first, a hint
+};
+
+type PullResponse =
+  | {
+      server_version: number;
+      last_mutation_id: number;
+      mutations: TableMutation[];
+      cursor?: string; // present: this response is one page, more follow
+      progress?: { done: number; total?: number };
+    }
+  | { reset: true };
+```
+
+- A response with a `cursor` is **partial**: the client applies its rows, stores the cursor (in the
+  database, so a reload resumes from it), keeps its `known_version` and pulls again with the cursor.
+  The cursor is opaque to the client.
+- The response without `cursor` ends the sequence: its `server_version` is stored, and the client
+  pulls once more, incrementally, from it.
+- Acknowledged mutations are not dropped until that incremental pull: a page may hold a row older
+  than a mutation the server has already applied, the replay keeps the local value right meanwhile.
+- `{ reset: true }`: the server cannot tell what changed since `known_version` (its history is
+  purged). The client empties the tables the server has sent rows for (local-only tables are kept), keeps its pending mutations and pulls
+  everything again from `known_version: 0`.
+
+`priority` is computed by the client from the tables its mounted reactive queries read, those of
+the latest mounted query first, so what the current screen shows arrives first. It is only sent
+on the first pull of a bootstrap (`known_version: 0`) and with a cursor. A server paging table by
+table serves the first table of `priority` it has not finished, and keeps one position per table in
+its cursor, so a change of priority pauses a table without losing or repeating rows.
+
+Each page is applied like a normal pull (in one transaction, with the pending mutations replayed
+on top) and notifies the reactive queries, so the data shows up page by page. Pushes keep working
+meanwhile.
+
+`engine.syncState()` tells whether the local data is still incomplete:
+
+```ts
+const { isBootstrapping, progress } = await engine.syncState();
+// isBootstrapping: pages are pending, or the catch-up pull after them
+// progress: the last `progress` sent by the server, if any
+```
+
+Use it to show a banner, or to mark totals and dashboards as provisional. Rows of different tables
+arrive in different pages, so a row can be there before the row it references: prefer `LEFT JOIN`
+and a placeholder ("syncing…") in the UI. Foreign keys are only checked at the end of each page
+(`PRAGMA defer_foreign_keys`), so a strict foreign key still fails when its target comes in a
+later page.
 
 ## Testing
 
