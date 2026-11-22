@@ -17,7 +17,7 @@ the tests.
 ```ts
 type PullRequest = {
   client_id: string;
-  known_version: string | null; // null: the client has nothing yet
+  version: string | null; // as received; null: the client has nothing yet
   cursor?: string; // the cursor of the previous page, as received
   limit?: number; // rows wanted per response, a hint
   priority?: string[]; // tables wanted first, a hint
@@ -26,7 +26,7 @@ type PullRequest = {
 type PullResponse =
   | {
       type: "changes";
-      server_version: string; // opaque to the client
+      version: string; // opaque to the client
       last_mutation_id: number; // last mutation applied for this client_id
       mutations: TableMutation[]; // applied in this order
       cursor?: string; // present: this response is a page, more follow
@@ -46,9 +46,9 @@ What the client does with a response:
 
 | Response                 | Client                                                                                                                            |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| no `cursor`              | applies the rows, stores `server_version`, drops the mutations up to `last_mutation_id`. If it was the last page, pulls once more. |
-| `cursor`                 | applies the rows, stores the cursor, keeps `known_version` and drops no mutation. Pulls again with the cursor at once.             |
-| `{ type: "reset" }`     | empties the tables the server has sent rows for (not the local-only ones), keeps its pending mutations, pulls again from `known_version: null`.                               |
+| no `cursor`              | applies the rows, stores `version`, drops the mutations up to `last_mutation_id`. If it was the last page, pulls once more. |
+| `cursor`                 | applies the rows, stores the cursor, keeps `version` and drops no mutation. Pulls again with the cursor at once.             |
+| `{ type: "reset" }`     | empties the tables the server has sent rows for (not the local-only ones), keeps its pending mutations, pulls again from `version: null`.                               |
 
 Versions and the cursor are opaque to the client: never parsed nor compared, only stored and sent
 back. A response answering a request made on a state that has changed since (another version or
@@ -58,7 +58,7 @@ client applies `upsert` as `INSERT … ON CONFLICT DO UPDATE` and `delete` of a 
 no-op: receiving a row twice is harmless.
 
 `priority` is computed by the client from the tables its mounted reactive queries read (the latest
-mounted query first). It is only sent on the first pull of a bootstrap (`known_version: null`) and
+mounted query first). It is only sent on the first pull of a bootstrap (`version: null`) and
 with a cursor.
 
 ## What a version means
@@ -72,7 +72,7 @@ version sent at the end is the one the bootstrap **started** from:
 
 1. First page: the server notes `V0`, its current version, and puts it in the cursor.
 2. Each page reads the current rows after its position.
-3. Last page (no `cursor`): `server_version: V0`, **not** the current version.
+3. Last page (no `cursor`): `version: V0`, **not** the current version.
 4. The client pulls incrementally from `V0` and gets everything that changed during the bootstrap:
    updates, inserts and deletes. Some rows come twice, which is harmless.
 
@@ -83,9 +83,9 @@ forever.
 
 Nothing here is specific to the bootstrap. **Any pull can be paged with the same rule**: take a
 version `Vstart` before the first page, page by a stable key, end with `Vstart`, and the client pulls
-again from `Vstart`. The bootstrap is the case `known_version: null` (all rows, no tombstone); an
+again from `Vstart`. The bootstrap is the case `version: null` (all rows, no tombstone); an
 incremental pull too large for one response (a client offline for months, or the catch-up after a
-long bootstrap) is the case `known_version: V` (rows and tombstones written since `V`). See
+long bootstrap) is the case `version: V` (rows and tombstones written since `V`). See
 [Paging a pull](#paging-a-pull) for both.
 
 The same holds for a pull in one response: the version must be taken **before** the rows are read
@@ -97,7 +97,7 @@ The same holds for a pull in one response: the version must be taken **before** 
    the current version.
 2. **Answer "what changed since V"**, deletions included: keep tombstones of deleted rows. If they
    are purged and `V` is older than the purge, answer `{ type: "reset" }` (never for
-   `known_version: null`). Keep them much longer than a bootstrap takes.
+   `version: null`). Keep them much longer than a bootstrap takes.
 3. **Page by key, never by `OFFSET`**:
    `WHERE (issued_on, id) < (:date, :id) ORDER BY issued_on DESC, id DESC LIMIT :limit`.
    With `OFFSET`, a row deleted from an earlier page shifts the next ones: a row that is never
@@ -217,10 +217,10 @@ Send the `xid8` version as text (`::text`): versions are strings, opaque to the 
 
 The same rule for every pull too large for one response: on the first page take `Vstart` (step 3)
 and put it in the cursor with the positions; each page reads by key after its position; the last
-page answers `server_version: Vstart`, never the current version; the client then pulls once more
+page answers `version: Vstart`, never the current version; the client then pulls once more
 from `Vstart`. Only the rows read change:
 
-**Bootstrap** (`known_version: null`, `Vstart` = `V0`): every current row, by a business key (here the
+**Bootstrap** (`version: null`, `Vstart` = `V0`): every current row, by a business key (here the
 newest invoices first, useful with `priority`). No tombstone: the client has nothing to delete.
 
 The key only walks the rows: it does not need to follow the commit order, only to be a total order
@@ -247,7 +247,7 @@ WHERE sync_xid >= :v AND sync_xid < :v1 AND (sync_xid, id) > (:pos_xid, :pos_id)
 ORDER BY sync_xid, id LIMIT :limit;
 ```
 
-Example: a client comes back after three months, `known_version: "5000"`. The server takes
+Example: a client comes back after three months, `version: "5000"`. The server takes
 `V1 = 9000`, sends the window `[5000, 9000)` in 40 pages, the last one answering `9000`. Meanwhile
 other users made 300 changes (`sync_xid >= 9000`): the next pull, from `9000`, sends them in one
 response.
@@ -391,7 +391,7 @@ need, a reset is simpler (`UPDATE sync_horizon SET purged_xid = pg_current_xact_
 
 **A dump restored into another cluster** (`pg_dump`/`pg_restore`, a move to another provider)
 starts again from lower transaction ids: the versions clients hold mean nothing there. Every client
-must start over from `known_version: null`, and the restored rows still carry the old cluster's
+must start over from `version: null`, and the restored rows still carry the old cluster's
 `sync_xid`. Rare, but plan it before the move. Physical replicas, failover and `pg_upgrade` keep the
 ids and are not concerned (`xid8` itself never wraps: it is 64 bits, epoch included).
 
@@ -414,7 +414,7 @@ ids and are not concerned (`xid8` itself never wraps: it is 64 bits, epoch inclu
 | Purging tombstones without a horizon | A client older than the purge never deletes those rows | Move `sync_horizon`, answer `reset` |
 | Upserts before deletions in one response | A row deleted then created again ends up deleted on the client | Deletions first |
 | Trusting `limit` | It is a hint from the client | Cap it on the server, also in bytes for large rows |
-| Answering `reset` to `known_version: null` | The client resets and asks again: loop | Never `reset` a bootstrap |
+| Answering `reset` to `version: null` | The client resets and asks again: loop | Never `reset` a bootstrap |
 
 A long-running transaction on the database (even idle, `idle in transaction`) holds `xmin` back:
 pulls keep sending the same rows again. Nothing is lost, but watch for them

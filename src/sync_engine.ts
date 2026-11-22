@@ -282,7 +282,7 @@ export class SyncEngine<
       request.limit = this.pullLimit;
     }
     // only where a server pages by table: incremental pulls are left unchanged
-    if (request.cursor !== undefined || request.known_version === null) {
+    if (request.cursor !== undefined || request.version === null) {
       const priority = this.priority();
       if (priority.length) {
         request.priority = priority;

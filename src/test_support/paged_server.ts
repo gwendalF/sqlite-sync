@@ -7,12 +7,12 @@ import type {
 
 /**
  * Fake backend for the tests. Single writer: the number of the last write is the version,
- * sent as a string.
+ * sent as an opaque token (`v30`), the format of this server only.
  *
- * - `known_version: null` with a `limit`: bootstrap by pages, table by table, by id. The
+ * - `version: null` with a `limit`: bootstrap by pages, table by table, by id. The
  *   cursor holds V0 and one position per table; the last page answers V0.
- * - `known_version: null` without `limit`: everything in one response.
- * - otherwise: what changed since `known_version` (tombstones included), in one
+ * - `version: null` without `limit`: everything in one response.
+ * - otherwise: what changed since `version` (tombstones included), in one
  *   response, or `reset` when the tombstones no longer go back that far.
  */
 export type Row = { id: number } & Record<string, unknown>;
@@ -84,11 +84,11 @@ export class PagedServer {
     if (request.cursor !== undefined) {
       return this.page(JSON.parse(request.cursor), request);
     }
-    if (request.known_version === null && request.limit !== undefined) {
+    if (request.version === null && request.limit !== undefined) {
       const pos = Object.fromEntries(this.tableOrder.map((t) => [t, 0]));
       return this.page({ v0: this.version, pos, done: 0 }, request);
     }
-    const since = Number(request.known_version ?? 0);
+    const since = request.version === null ? 0 : fromToken(request.version);
     if (since > 0 && since < this.historyStart) {
       return { type: "reset" };
     }
@@ -127,11 +127,14 @@ export class PagedServer {
     mutations: TableMutation[],
   ) => ({
     type: "changes" as const,
-    server_version: String(version),
+    version: toToken(version),
     last_mutation_id: this.clients.get(request.client_id) ?? 0,
     mutations,
   });
 }
+
+const toToken = (version: number) => `v${version}`;
+const fromToken = (token: string) => Number(token.slice(1));
 
 const upserts = (table: string, rows: Row[]): TableMutation => ({
   op: "upsert",

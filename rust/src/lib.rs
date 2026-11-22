@@ -137,14 +137,14 @@ pub struct SqliteEngine {
     connection: Pin<Box<rusqlite::Connection>>,
     pool: Option<sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil>,
     /// Version of the last complete pull, opaque. `None`: nothing pulled yet.
-    server_version: Option<String>,
+    version: Option<String>,
     /// Cursor of the partial pull in progress, as last committed.
     cursor: Option<String>,
     push_state: PushState,
 }
 
 /// Keys of the `config` table holding the pull state.
-const SERVER_VERSION: &str = "server_version";
+const VERSION: &str = "version";
 const PULL_CURSOR: &str = "pull_cursor";
 const PULL_PROGRESS: &str = "pull_progress";
 /// Set from the first partial page until the incremental pull that follows the last one.
@@ -163,7 +163,7 @@ pub struct SqlOutput {
 pub struct PullRequest {
     client_id: String,
     /// Sent as `null` when the client has nothing yet.
-    known_version: Option<String>,
+    version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<String>,
 }
@@ -171,7 +171,7 @@ pub struct PullRequest {
 /// The part of the request a response answers, to detect stale responses.
 #[derive(Deserialize)]
 pub struct PullRequestEcho {
-    known_version: Option<String>,
+    version: Option<String>,
     cursor: Option<String>,
 }
 
@@ -179,14 +179,14 @@ pub struct PullRequestEcho {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum PullResponse {
     Changes {
-        server_version: String,
+        version: String,
         last_mutation_id: usize,
         mutations: Vec<TableMutation>,
         /// Present on a partial response: pull again with it.
         cursor: Option<String>,
         progress: Option<serde_json::Value>,
     },
-    /// The server cannot answer from `known_version`: drop the replicated data.
+    /// The server cannot answer from `version`: drop the replicated data.
     Reset,
 }
 
@@ -320,13 +320,13 @@ impl SqliteEngine {
             err => err?,
         };
 
-        let (server_version, cursor) = Self::read_pull_state(&conn)?;
+        let (version, cursor) = Self::read_pull_state(&conn)?;
 
         Ok(SqliteEngine {
             client_id,
             connection: Box::pin(conn),
             pool,
-            server_version,
+            version,
             cursor,
             push_state: PushState::Idle,
         })
@@ -335,16 +335,7 @@ impl SqliteEngine {
     fn read_pull_state(
         conn: &rusqlite::Connection,
     ) -> rusqlite::Result<(Option<String>, Option<String>)> {
-        // an integer is a version from before versions were strings: start over
-        let version = match conn.query_row(
-            "SELECT value FROM config WHERE key = ? AND typeof(value) = 'text'",
-            (SERVER_VERSION,),
-            |row| row.get(0),
-        ) {
-            Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(e),
-        };
+        let version = Self::config_get::<String>(conn, VERSION)?;
         let cursor = Self::config_get::<String>(conn, PULL_CURSOR)?;
         Ok((version, cursor))
     }
@@ -516,7 +507,7 @@ impl SqliteEngine {
             .serialize_maps_as_objects(true)
             .serialize_missing_as_null(true);
         let request = PullRequest {
-            known_version: self.server_version.clone(),
+            version: self.version.clone(),
             client_id: self.client_id.clone(),
             cursor: self.cursor.clone(),
         };
@@ -532,7 +523,7 @@ impl SqliteEngine {
     /// opaque, never compared: the next pull gets what an ignored response held.
     ///
     /// A response with a `cursor` is one page of a partial pull: its rows are applied but
-    /// `server_version` is kept, the cursor is stored to resume from it. Acknowledged
+    /// `version` is kept, the cursor is stored to resume from it. Acknowledged
     /// mutations are only purged by a pull that is not part of a partial pull: a page may
     /// hold a row older than a mutation the server has already applied.
     #[wasm_bindgen]
@@ -543,7 +534,7 @@ impl SqliteEngine {
     ) -> Result<Option<JsLocalMutations>> {
         let request: PullRequestEcho = serde_wasm_bindgen::from_value(request.into())?;
         let response: PullResponse = serde_wasm_bindgen::from_value(response.into())?;
-        if request.known_version != self.server_version || request.cursor != self.cursor {
+        if request.version != self.version || request.cursor != self.cursor {
             return Ok(None);
         }
 
@@ -582,7 +573,7 @@ impl SqliteEngine {
             .execute("PRAGMA defer_foreign_keys = ON", ())?;
 
         let PullResponse::Changes {
-            server_version,
+            version,
             last_mutation_id,
             mutations: changes,
             cursor: next_cursor,
@@ -592,7 +583,7 @@ impl SqliteEngine {
             // no purge: the pending mutations are replayed on the empty tables
             let mutations = self.revert_changesets(0)?;
             self.clear_replicated_tables()?;
-            self.config_set(SERVER_VERSION, None)?;
+            self.config_set(VERSION, None)?;
             self.config_set(PULL_CURSOR, None)?;
             self.config_set(PULL_PROGRESS, None)?;
             self.config_set(BOOTSTRAPPING, None)?;
@@ -613,7 +604,7 @@ impl SqliteEngine {
             }
             None => {
                 self.config_set(PULL_CURSOR, None)?;
-                self.config_set(SERVER_VERSION, Some(Value::Text(server_version)))?;
+                self.config_set(VERSION, Some(Value::Text(version)))?;
             }
         }
 
@@ -667,8 +658,8 @@ impl SqliteEngine {
     #[wasm_bindgen]
     pub fn end_rebasing(&mut self) -> Result<()> {
         self.connection.execute("COMMIT", ())?;
-        let (server_version, cursor) = Self::read_pull_state(&self.connection)?;
-        self.server_version = server_version;
+        let (version, cursor) = Self::read_pull_state(&self.connection)?;
+        self.version = version;
         self.cursor = cursor;
         Ok(())
     }
