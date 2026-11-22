@@ -513,36 +513,52 @@ impl SqliteEngine {
 
     #[wasm_bindgen]
     pub fn start_mutate(&mut self) -> Result<()> {
+        if matches!(self.push_state, PushState::InProgress { .. }) {
+            return Err(WasmError::Other(String::from(
+                "capture already in progress",
+            )));
+        }
         self.connection.execute("BEGIN", ())?;
-        let mut session = Session::new(&self.connection).map_err(|e| RollbackErr {
-            reason: e.to_string(),
-            conn: &self.connection,
-        })?;
-        // Shadow tables (FTS5, R*Tree...) are written by their virtual table, itself
-        // fed by triggers on real tables: replaying the real tables rebuilds them.
-        let shadow_tables = self.shadow_tables().map_err(|e| RollbackErr {
-            reason: e.to_string(),
-            conn: &self.connection,
-        })?;
-        session.table_filter(Some(move |table: &str| !shadow_tables.contains(table)));
-        session.attach::<&str>(None).map_err(|e| RollbackErr {
-            reason: e.to_string(),
-            conn: &self.connection,
-        })?;
-
-        // we can assume static lifetime because connection is held by the struct and pin
-        // clippy warn but we extend the lifetime so the as is necessary
-        #[allow(clippy::unnecessary_cast)]
-        let session = Box::into_raw(Box::new(session)) as *mut Session<'static>;
-
-        let session = NonNull::new(session).unwrap();
-        self.push_state = PushState::InProgress { session };
+        if let Err(e) = self.open_session() {
+            let _ = self.connection.execute("ROLLBACK", ());
+            return Err(e);
+        }
         Ok(())
     }
 
+    /// Starts recording the changes of a replayed mutation. No BEGIN: replays run
+    /// inside the transaction opened by `start_rebasing`.
     #[wasm_bindgen]
-    pub fn rollback(&self) -> Result<()> {
-        self.connection.execute("ROLLBACK", ())?;
+    pub fn start_capture(&mut self) -> Result<()> {
+        if matches!(self.push_state, PushState::InProgress { .. }) {
+            return Err(WasmError::Other(String::from(
+                "capture already in progress",
+            )));
+        }
+        self.open_session()
+    }
+
+    /// Stores the changeset of a replayed mutation, computed on the new base, so the
+    /// next rebase reverts what the replay actually did and not what the original
+    /// run did on a base that no longer exists.
+    #[wasm_bindgen]
+    pub fn end_replay(&mut self, id: usize) -> Result<()> {
+        let inverted_changeset = self.close_session()?;
+        let mut stmt = self
+            .connection
+            .prepare_cached("UPDATE pending_mutations SET changeset = ? WHERE id = ?")?;
+        stmt.execute(params![inverted_changeset, id as i64])?;
+        Ok(())
+    }
+
+    /// Aborts the current mutation or rebase: frees the session if any and rolls back
+    /// if a transaction is open. Safe to call in any state.
+    #[wasm_bindgen]
+    pub fn rollback(&mut self) -> Result<()> {
+        drop(self.take_session());
+        if !self.connection.is_autocommit() {
+            self.connection.execute("ROLLBACK", ())?;
+        }
         Ok(())
     }
 
@@ -560,31 +576,12 @@ impl SqliteEngine {
 
     #[wasm_bindgen]
     pub fn end_mutate(&mut self, name: &str, args: Option<String>) -> Result<()> {
-        match self.push_state {
-            PushState::Idle => return Err(WasmError::Other(String::from("not in mutation"))),
-            PushState::InProgress { session } => {
-                {
-                    // session is valid since it has not moved and the connection is pinned so has not moved either
-                    let mut session = unsafe { Box::from_raw(session.as_ptr()) };
-                    let mut changeset = vec![];
-
-                    session.changeset_strm(&mut changeset)?;
-                    let mut inverted_changeset = Vec::with_capacity(changeset.len());
-                    let mut input = changeset.as_slice();
-                    invert_strm(&mut input, &mut inverted_changeset)?;
-
-                    let mut stmt = self.connection.prepare_cached(
-                    "INSERT INTO pending_mutations (name, args, changeset) VALUES (?, jsonb(?), ?)",
-                )?;
-
-                    stmt.execute(params![name, args, inverted_changeset])?;
-                }
-
-                self.connection.execute("COMMIT", ())?;
-                self.push_state = PushState::Idle;
-            }
-        };
-
+        let inverted_changeset = self.close_session()?;
+        let mut stmt = self.connection.prepare_cached(
+            "INSERT INTO pending_mutations (name, args, changeset) VALUES (?, jsonb(?), ?)",
+        )?;
+        stmt.execute(params![name, args, inverted_changeset])?;
+        self.connection.execute("COMMIT", ())?;
         Ok(())
     }
 
@@ -625,6 +622,49 @@ impl SqliteEngine {
                 Ok(())
             }
         }
+    }
+
+    fn open_session(&mut self) -> Result<()> {
+        let mut session = Session::new(&self.connection)?;
+        // Shadow tables (FTS5, R*Tree...) are written by their virtual table, itself
+        // fed by triggers on real tables: replaying the real tables rebuilds them.
+        let shadow_tables = self.shadow_tables()?;
+        session.table_filter(Some(move |table: &str| !shadow_tables.contains(table)));
+        session.attach::<&str>(None)?;
+
+        // we can assume static lifetime because connection is held by the struct and pin
+        // clippy warn but we extend the lifetime so the as is necessary
+        #[allow(clippy::unnecessary_cast)]
+        let session = Box::into_raw(Box::new(session)) as *mut Session<'static>;
+
+        let session = NonNull::new(session).unwrap();
+        self.push_state = PushState::InProgress { session };
+        Ok(())
+    }
+
+    /// Takes the session out of `push_state` first, so an error later on can never
+    /// leave a dangling pointer behind.
+    fn take_session(&mut self) -> Option<Box<Session<'static>>> {
+        match std::mem::replace(&mut self.push_state, PushState::Idle) {
+            PushState::Idle => None,
+            // session is valid since it has not moved and the connection is pinned so has not moved either
+            PushState::InProgress { session } => Some(unsafe { Box::from_raw(session.as_ptr()) }),
+        }
+    }
+
+    /// Ends the capture and returns the inverted changeset.
+    fn close_session(&mut self) -> Result<Vec<u8>> {
+        let mut session = self
+            .take_session()
+            .ok_or_else(|| WasmError::Other(String::from("not in mutation")))?;
+        let mut changeset = vec![];
+        session.changeset_strm(&mut changeset)?;
+        drop(session);
+
+        let mut inverted_changeset = Vec::with_capacity(changeset.len());
+        let mut input = changeset.as_slice();
+        invert_strm(&mut input, &mut inverted_changeset)?;
+        Ok(inverted_changeset)
     }
 
     /// Tables owned by a virtual table of the main schema (`docs_fts_data`, `geo_node`...).

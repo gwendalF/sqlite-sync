@@ -14,6 +14,8 @@ const makeHandlers = (engine: SqliteEngine): RpcHandlers => ({
   beginPull: () => engine.begin_pull(),
   endRebase: (version: number) => engine.end_rebasing(version),
   startRebase: (response: PullResponse) => engine.start_rebasing(response),
+  startCapture: () => engine.start_capture(),
+  endReplay: (id: number) => engine.end_replay(id),
   query: (query: RustQuery) => {
     const { rows, is_readonly } = engine.sql_exec({
       sql: query.sql,

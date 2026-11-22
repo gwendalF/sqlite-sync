@@ -25,6 +25,8 @@ export type RpcMethods = {
   /** `undefined` when the response is stale and must be ignored */
   startRebase: { args: PullResponse; result: LocalMutations | undefined };
   endRebase: { args: number; result: void };
+  startCapture: { args: undefined; result: void };
+  endReplay: { args: number; result: void };
   query: {
     args: RustQuery;
     result: { rows: unknown[]; isReadonly: boolean };
