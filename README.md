@@ -144,8 +144,7 @@ Instance methods:
 - `engine.sql<T>(query, { committed? })` – read-only query, resolves to `{ rows: T[] }`. Meant for
   debugging and one-off reads: by default it does not wait for a running mutation or rebase, so it
   may see changes that are rolled back afterwards. With `committed: true` it waits for them and
-  only sees committed data; never set it inside a mutator, which already holds the lock. Use
-  `reactiveQuery` to read data, and mutators to write it.
+  only sees committed data. Use `reactiveQuery` to read data, and mutators to write it.
 - `engine.reactiveQuery<T>(query, { onChange, onError? })` – resolves to `{ data, unlisten }`.
   `onChange` is called with fresh rows when a table read by the query changes (locally, in
   another tab, or after a pull).

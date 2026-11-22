@@ -137,7 +137,8 @@ export class SyncEngine<M extends MutatorsConfig> {
    *
    * By default it does not wait for a running mutation or rebase, so it may see changes
    * rolled back afterwards. `committed: true` waits for them and only sees committed data.
-   * Do not set it from inside a mutator: the lock is already held and would never be freed.
+   * Takes the task lock: calling it from code that already holds the lock (e.g. through a
+   * closure in a mutator) never resolves.
    */
   sql = async <T = unknown>(
     query: Query,
