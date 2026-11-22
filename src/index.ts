@@ -1,4 +1,4 @@
-export { SyncEngine, sql } from "./sync_engine.ts";
+export { SyncEngine, ProtocolError, sql } from "./sync_engine.ts";
 export type {
   Config,
   PublicMutators,

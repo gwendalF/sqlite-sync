@@ -1,5 +1,5 @@
 import { describe, test as baseTest, vi, ExpectStatic } from "vitest";
-import { sql, SyncEngine } from "./sync_engine";
+import { ProtocolError, sql, SyncEngine } from "./sync_engine";
 import { Syncer } from "./syncer";
 import { DBHandle, Query, ValidatedConfig } from "./config";
 import { createTestHub } from "./testing";
@@ -170,6 +170,69 @@ describe("malformed response", () => {
     const engine = await buildEngine(hub, { syncer, onSync: () => {} });
 
     await expect(engine.sync()).rejects.toThrow("missing field `version`");
+  });
+});
+
+describe("misbehaving backend", () => {
+  it("fails the sync on a reset answering a pull without version", async ({
+    expect,
+    hub,
+  }) => {
+    const syncer: Syncer = {
+      push: vi.fn(),
+      pull: vi.fn().mockResolvedValue({ type: "reset" }),
+    };
+    const engine = await buildEngine(hub, { syncer, onSync: () => {} });
+
+    await expect(engine.sync()).rejects.toBeInstanceOf(ProtocolError);
+    expect(syncer.pull).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails the sync on a page answering the cursor it was sent", async ({
+    expect,
+    hub,
+  }) => {
+    const page = {
+      type: "changes",
+      version: "v1",
+      last_mutation_id: 0,
+      mutations: [],
+      cursor: "same",
+    };
+    const syncer: Syncer = {
+      push: vi.fn(),
+      pull: vi.fn().mockResolvedValue(page),
+    };
+    const engine = await buildEngine(hub, { syncer, onSync: () => {} });
+
+    await expect(engine.sync()).rejects.toBeInstanceOf(ProtocolError);
+    expect(syncer.pull).toHaveBeenCalledTimes(2);
+    expect(await storedCursor(hub)).toBe("same");
+  });
+
+  it("fails the sync, without applying it, on a last page answering another version than the pages", async ({
+    expect,
+    hub,
+    server,
+  }) => {
+    const { syncer } = connect(server);
+    const pull = syncer.pull;
+    syncer.pull = async (request) => {
+      const response = await pull(request);
+      // the current version, newer than V0
+      return response.type === "changes" && response.cursor === undefined
+        ? { ...response, version: "v31" }
+        : response;
+    };
+    const engine = await buildEngine(hub, {
+      syncer,
+      pullLimit: 4,
+      onSync: () => {},
+    });
+
+    await expect(engine.sync()).rejects.toBeInstanceOf(ProtocolError);
+    expect(await storedCursor(hub)).toEqual(expect.any(String));
+    expect(await engine.syncState()).toMatchObject({ isBootstrapping: true });
   });
 });
 
@@ -456,7 +519,7 @@ describe("partial pull", () => {
   }) => {
     const upsert = (id: number, label: string): Extract<PullResponse, { type: "changes" }> => ({
       type: "changes",
-      version: "v50", // ignored on a page
+      version: "v40", // V1, taken on the first page: every page answers it
       last_mutation_id: 0,
       mutations: [
         {

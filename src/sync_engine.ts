@@ -15,7 +15,7 @@ import {
 } from "./config";
 import { Method, RpcArgs, SyncState } from "./messages.ts";
 import { Platform } from "./platform/platform.ts";
-import type { PullRequest } from "./sync_sqlite/sync_sqlite.js";
+import type { PullRequest, PullResponse } from "./sync_sqlite/sync_sqlite.js";
 
 export type ReactiveHandlers<T> = {
   onChange: (data: T[]) => void;
@@ -26,6 +26,14 @@ type Listener = { tables: Set<string>; onChange(): void };
 
 /** Every table: sent after a reset, which empties them all. */
 type Changes = string[] | "*";
+
+/**
+ * The server broke the pull protocol in a way that would lose data or never end.
+ * The response is not applied and the sync fails.
+ */
+export class ProtocolError extends Error {
+  override name = "ProtocolError";
+}
 
 export function sql(
   strings: TemplateStringsArray,
@@ -53,6 +61,8 @@ export class SyncEngine<
   private onSync: (result: SyncResult) => void;
   private pullLimit: number | undefined;
   private syncStateListeners = new Set<(state: SyncState) => void>();
+  /** The last page this engine applied: the pages that follow it must answer its version. */
+  private lastPage: { cursor: string; version: string } | undefined;
 
   private rawMutators: Record<
     string,
@@ -289,12 +299,17 @@ export class SyncEngine<
       }
     }
     const response = await this.syncer.pull(request);
+    this.checkResponse(request, response);
 
     return this.platform.lock(async () => {
       const mutations = await this.call("startRebase", { request, response });
       if (!mutations) {
         return false;
       }
+      this.lastPage =
+        response.type === "changes" && response.cursor !== undefined
+          ? { cursor: response.cursor, version: response.version }
+          : undefined;
 
       let changes: Changes;
       try {
@@ -329,6 +344,36 @@ export class SyncEngine<
         response.cursor !== undefined;
       return pullAgain;
     });
+  };
+
+  /**
+   * Best effort: only catches the mistakes visible from this engine. The version is
+   * only checked between pages this engine applied one after the other.
+   */
+  private checkResponse = (request: PullRequest, response: PullResponse) => {
+    if (response.type === "reset") {
+      if (request.version === null && request.cursor === undefined) {
+        throw new ProtocolError(
+          "the server answered reset to a pull without version: the client would bootstrap again forever",
+        );
+      }
+      return;
+    }
+
+    if (response.cursor !== undefined && response.cursor === request.cursor) {
+      throw new ProtocolError(
+        "the server answered the cursor it was sent: the pull would never end",
+      );
+    }
+
+    const page = this.lastPage;
+    if (page && request.cursor === page.cursor && response.version !== page.version) {
+      throw new ProtocolError(
+        `the server answered version ${JSON.stringify(response.version)} to a page of a pull ` +
+          `that answered ${JSON.stringify(page.version)}: every page, the last one included, ` +
+          "must answer the version taken on the first page",
+      );
+    }
   };
 
   /**
