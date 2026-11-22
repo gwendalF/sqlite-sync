@@ -44,11 +44,11 @@ export async function createServer() {
     // read in this order: last_mutation_id, then the version, then the rows
     const lmid = await lastMutationId(request.client_id);
     if (request.cursor) return page(decode(request.cursor), request, lmid);
-    if (request.known_version === 0) {
+    if (request.known_version === null) {
       const pos = Object.fromEntries(TABLES.map((t) => [t.name, null]));
       return page({ v0: await version(), pos, done: 0 }, request, lmid);
     }
-    return changesSince(String(request.known_version), lmid);
+    return changesSince(request.known_version, lmid);
   }
 
   // one bootstrap page: the current rows after the position of one table, by key
@@ -71,7 +71,8 @@ export async function createServer() {
     const done = cursor.done + rows.length;
 
     const response = {
-      server_version: Number(cursor.v0), // V0, never the current version
+      type: "changes",
+      server_version: cursor.v0, // V0, never the current version
       last_mutation_id: lmid,
       mutations: rows.length
         ? [{ op: "upsert", table: name, pks: ["id"], records: rows.map(({ sync_key, ...r }) => r) }]
@@ -84,7 +85,7 @@ export async function createServer() {
   // incremental: what transactions from V on wrote (>=), deletions first
   async function changesSince(v, lmid) {
     const { rows: [h] } = await db.query(`SELECT $1::text::xid8 <= purged_xid AS reset FROM sync_horizon`, [v]);
-    if (h.reset) return { reset: true };
+    if (h.reset) return { type: "reset" };
 
     const next = await version(); // before reading the rows
     const mutations = [];
@@ -97,7 +98,7 @@ export async function createServer() {
       const { rows } = await db.query(`SELECT ${select} FROM ${name} WHERE sync_xid >= $1::text::xid8`, [v]);
       if (rows.length) mutations.push({ op: "upsert", table: name, pks: ["id"], records: rows });
     }
-    return { server_version: Number(next), last_mutation_id: lmid, mutations };
+    return { type: "changes", server_version: next, last_mutation_id: lmid, mutations };
   }
 
   return { db, push, pull };

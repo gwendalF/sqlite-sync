@@ -244,23 +244,38 @@ type PushRequest = {
 changed since, its current version, and the last mutation id it has applied for this client.
 
 ```ts
-type PullRequest = { client_id: string; known_version: number };
+type PullRequest = {
+  client_id: string;
+  known_version: string | null; // as received, null: the client has nothing yet
+  cursor?: string; // the cursor of the previous page, sent back as received
+  limit?: number; // `pullLimit`, a hint
+  priority?: string[]; // tables wanted first, a hint
+};
 
-type PullResponse = {
-  server_version: number;
-  last_mutation_id: number;
-  mutations: {
-    op: "upsert" | "delete";
-    table: string;
-    pks: string[]; // primary key column names
-    records: Record<string, unknown>[]; // full rows for upsert, key columns for delete
-  }[];
+type PullResponse =
+  | {
+      type: "changes";
+      server_version: string; // opaque to the client
+      last_mutation_id: number;
+      mutations: TableMutation[];
+      cursor?: string; // present: this response is one page, more follow
+      progress?: { done: number; total?: number };
+    }
+  | { type: "reset" };
+
+type TableMutation = {
+  op: "upsert" | "delete";
+  table: string;
+  pks: string[]; // primary key column names
+  records: Record<string, unknown>[]; // full rows for upsert, key columns for delete
 };
 ```
 
 On pull, the client rolls back its local pending mutations, applies the server changes, drops the
 mutations the server has acknowledged (`id <= last_mutation_id`), and replays the remaining ones on
-top. Stale responses (older than the state already applied) are ignored.
+top. Versions are opaque: the client stores them and sends them back, never compares them. A
+response to a request made on a state that has changed since (another version or cursor, after a
+concurrent pull) is ignored; the next pull gets its changes.
 
 Mutations stay pending, and are pushed again, until a pull acknowledges them: the server must skip
 the ids it has already processed for this `client_id`.
@@ -269,29 +284,8 @@ the ids it has already processed for this `client_id`.
 
 See [docs/backend.md](docs/backend.md) for what the server must guarantee, and a PostgreSQL recipe.
 
-Optional: a server that answers every pull in one response needs nothing more. For large volumes
-(the first sync of a new device, a client offline for months), the server can split its answer in
-pages:
-
-```ts
-type PullRequest = {
-  client_id: string;
-  known_version: number;
-  cursor?: string; // the cursor of the previous page, sent back as received
-  limit?: number; // `pullLimit`, a hint
-  priority?: string[]; // tables wanted first, a hint
-};
-
-type PullResponse =
-  | {
-      server_version: number;
-      last_mutation_id: number;
-      mutations: TableMutation[];
-      cursor?: string; // present: this response is one page, more follow
-      progress?: { done: number; total?: number };
-    }
-  | { reset: true };
-```
+A server that answers every pull in one response needs nothing more. For large volumes (the first
+sync of a new device, a client offline for months), it can split its answer in pages:
 
 - A response with a `cursor` is **partial**: the client applies its rows, stores the cursor (in the
   database, so a reload resumes from it), keeps its `known_version` and pulls again with the cursor.
@@ -300,13 +294,13 @@ type PullResponse =
   pulls once more, incrementally, from it.
 - Acknowledged mutations are not dropped until that incremental pull: a page may hold a row older
   than a mutation the server has already applied, the replay keeps the local value right meanwhile.
-- `{ reset: true }`: the server cannot tell what changed since `known_version` (its history is
-  purged). The client empties the tables the server has sent rows for (local-only tables are kept), keeps its pending mutations and pulls
-  everything again from `known_version: 0`.
+- `{ type: "reset" }`: the server cannot tell what changed since `known_version` (its history is
+  purged). The client empties the tables the server has sent rows for (local-only tables are
+  kept), keeps its pending mutations and pulls everything again from `known_version: null`.
 
 `priority` is computed by the client from the tables its mounted reactive queries read, those of
 the latest mounted query first, so what the current screen shows arrives first. It is only sent
-on the first pull of a bootstrap (`known_version: 0`) and with a cursor. A server paging table by
+on the first pull of a bootstrap (`known_version: null`) and with a cursor. A server paging table by
 table serves the first table of `priority` it has not finished, and keeps one position per table in
 its cursor, so a change of priority pauses a table without losing or repeating rows.
 

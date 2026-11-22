@@ -282,7 +282,7 @@ export class SyncEngine<
       request.limit = this.pullLimit;
     }
     // only where a server pages by table: incremental pulls are left unchanged
-    if (request.cursor !== undefined || request.known_version === 0) {
+    if (request.cursor !== undefined || request.known_version === null) {
       const priority = this.priority();
       if (priority.length) {
         request.priority = priority;
@@ -299,7 +299,7 @@ export class SyncEngine<
       let changes: Changes;
       try {
         const updated = new Set(
-          response.reset ? [] : response.mutations.map((m) => m.table),
+          response.type === "reset" ? [] : response.mutations.map((m) => m.table),
         );
         for (const mutation of mutations) {
           const { fn, deserialize } = this.rawMutators[mutation.name];
@@ -313,7 +313,7 @@ export class SyncEngine<
           await this.call("endReplay", mutation.id);
         }
         await this.call("endRebase");
-        changes = response.reset ? "*" : [...updated.keys()];
+        changes = response.type === "reset" ? "*" : [...updated.keys()];
       } catch (e) {
         await this.call("rollback");
         throw e;
@@ -322,7 +322,7 @@ export class SyncEngine<
       this.notify(changes);
       await this.emitSyncState();
       return (
-        response.reset ||
+        response.type === "reset" ||
         request.cursor !== undefined ||
         response.cursor !== undefined
       );

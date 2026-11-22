@@ -96,7 +96,8 @@ async function setup<M extends MutatorsConfig>(
   let version = 0;
   const sync = async (acked: number, ...mutations: Mutation[]) => {
     pull.mockResolvedValueOnce({
-      server_version: ++version,
+      type: "changes",
+      server_version: String(++version),
       last_mutation_id: acked,
       mutations,
     });

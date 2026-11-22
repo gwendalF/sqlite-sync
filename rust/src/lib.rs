@@ -136,7 +136,8 @@ pub struct SqliteEngine {
     client_id: String,
     connection: Pin<Box<rusqlite::Connection>>,
     pool: Option<sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil>,
-    server_version: usize,
+    /// Version of the last complete pull, opaque. `None`: nothing pulled yet.
+    server_version: Option<String>,
     /// Cursor of the partial pull in progress, as last committed.
     cursor: Option<String>,
     push_state: PushState,
@@ -161,7 +162,8 @@ pub struct SqlOutput {
 #[derive(Serialize)]
 pub struct PullRequest {
     client_id: String,
-    known_version: usize,
+    /// Sent as `null` when the client has nothing yet.
+    known_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<String>,
 }
@@ -169,43 +171,23 @@ pub struct PullRequest {
 /// The part of the request a response answers, to detect stale responses.
 #[derive(Deserialize)]
 pub struct PullRequestEcho {
-    known_version: usize,
+    known_version: Option<String>,
     cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
-pub struct PullResponse {
-    server_version: usize,
-    last_mutation_id: usize,
-    mutations: Vec<TableMutation>,
-    /// Present on a partial response: pull again with it.
-    cursor: Option<String>,
-    progress: Option<serde_json::Value>,
-}
-
-/// Read first: `{ reset: true }` has none of the fields of a normal response,
-/// which are then all required.
-#[derive(Deserialize)]
-struct ResetFlag {
-    #[serde(default)]
-    reset: bool,
-}
-
-/// What the server answered.
-enum Pulled {
-    /// It cannot answer from `known_version`: drop the replicated data.
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum PullResponse {
+    Changes {
+        server_version: String,
+        last_mutation_id: usize,
+        mutations: Vec<TableMutation>,
+        /// Present on a partial response: pull again with it.
+        cursor: Option<String>,
+        progress: Option<serde_json::Value>,
+    },
+    /// The server cannot answer from `known_version`: drop the replicated data.
     Reset,
-    Changes(PullResponse),
-}
-
-impl Pulled {
-    fn from_js(value: wasm_bindgen::JsValue) -> Result<Self> {
-        let flag: ResetFlag = serde_wasm_bindgen::from_value(value.clone())?;
-        if flag.reset {
-            return Ok(Pulled::Reset);
-        }
-        Ok(Pulled::Changes(serde_wasm_bindgen::from_value(value)?))
-    }
 }
 
 #[derive(Serialize)]
@@ -338,10 +320,6 @@ impl SqliteEngine {
             err => err?,
         };
 
-        conn.execute(
-            "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
-            params![SERVER_VERSION, 0],
-        )?;
         let (server_version, cursor) = Self::read_pull_state(&conn)?;
 
         Ok(SqliteEngine {
@@ -354,14 +332,21 @@ impl SqliteEngine {
         })
     }
 
-    fn read_pull_state(conn: &rusqlite::Connection) -> rusqlite::Result<(usize, Option<String>)> {
-        let version: i64 = conn.query_row(
-            "SELECT value FROM config WHERE key = ?",
+    fn read_pull_state(
+        conn: &rusqlite::Connection,
+    ) -> rusqlite::Result<(Option<String>, Option<String>)> {
+        // an integer is a version from before versions were strings: start over
+        let version = match conn.query_row(
+            "SELECT value FROM config WHERE key = ? AND typeof(value) = 'text'",
             (SERVER_VERSION,),
             |row| row.get(0),
-        )?;
+        ) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
         let cursor = Self::config_get::<String>(conn, PULL_CURSOR)?;
-        Ok((version as usize, cursor))
+        Ok((version, cursor))
     }
 
     fn config_get<T: rusqlite::types::FromSql>(
@@ -527,9 +512,11 @@ impl SqliteEngine {
 
     #[wasm_bindgen]
     pub fn begin_pull(&mut self) -> Result<JsPullRequest> {
-        let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+        let serializer = serde_wasm_bindgen::Serializer::new()
+            .serialize_maps_as_objects(true)
+            .serialize_missing_as_null(true);
         let request = PullRequest {
-            known_version: self.server_version,
+            known_version: self.server_version.clone(),
             client_id: self.client_id.clone(),
             cursor: self.cursor.clone(),
         };
@@ -539,9 +526,10 @@ impl SqliteEngine {
     }
 
     /// Pulls can run concurrently (several tabs, or several syncs of the same tab), so their
-    /// responses may arrive out of order. A stale response (answering a request made on a
-    /// state that has moved since, or older than the state already applied) is ignored:
-    /// nothing is done and `None` is returned, the caller must not call `end_rebasing`.
+    /// responses may arrive out of order. A response answering a request made on a state
+    /// that has moved since (another version or cursor) is stale and ignored: nothing is
+    /// done and `None` is returned, the caller must not call `end_rebasing`. Versions are
+    /// opaque, never compared: the next pull gets what an ignored response held.
     ///
     /// A response with a `cursor` is one page of a partial pull: its rows are applied but
     /// `server_version` is kept, the cursor is stored to resume from it. Acknowledged
@@ -554,19 +542,8 @@ impl SqliteEngine {
         response: JsPullResponse,
     ) -> Result<Option<JsLocalMutations>> {
         let request: PullRequestEcho = serde_wasm_bindgen::from_value(request.into())?;
-        let response = Pulled::from_js(response.into())?;
-        if request.cursor != self.cursor {
-            return Ok(None);
-        }
-        let stale = match &response {
-            // a reset or a page only makes sense for the state the request was made on
-            Pulled::Reset => request.known_version != self.server_version,
-            Pulled::Changes(r) if r.cursor.is_some() => {
-                request.known_version != self.server_version
-            }
-            Pulled::Changes(r) => r.server_version < self.server_version,
-        };
-        if stale {
+        let response: PullResponse = serde_wasm_bindgen::from_value(response.into())?;
+        if request.known_version != self.server_version || request.cursor != self.cursor {
             return Ok(None);
         }
 
@@ -597,45 +574,46 @@ impl SqliteEngine {
 
     /// Reverts the pending mutations and writes the response, in the open transaction.
     /// Returns the mutations to replay.
-    fn rebase_on(&self, cursor: &Option<String>, response: Pulled) -> Result<Vec<Mutation>> {
+    fn rebase_on(&self, cursor: &Option<String>, response: PullResponse) -> Result<Vec<Mutation>> {
         use rusqlite::types::Value;
 
         // a page may hold a row before the row it references
         self.connection
             .execute("PRAGMA defer_foreign_keys = ON", ())?;
 
-        let response = match response {
-            Pulled::Reset => {
-                // no purge: the pending mutations are replayed on the empty tables
-                let mutations = self.revert_changesets(0)?;
-                self.clear_replicated_tables()?;
-                self.config_set(SERVER_VERSION, Some(Value::Integer(0)))?;
-                self.config_set(PULL_CURSOR, None)?;
-                self.config_set(PULL_PROGRESS, None)?;
-                self.config_set(BOOTSTRAPPING, None)?;
-                return Ok(mutations);
-            }
-            Pulled::Changes(response) => response,
+        let PullResponse::Changes {
+            server_version,
+            last_mutation_id,
+            mutations: changes,
+            cursor: next_cursor,
+            progress,
+        } = response
+        else {
+            // no purge: the pending mutations are replayed on the empty tables
+            let mutations = self.revert_changesets(0)?;
+            self.clear_replicated_tables()?;
+            self.config_set(SERVER_VERSION, None)?;
+            self.config_set(PULL_CURSOR, None)?;
+            self.config_set(PULL_PROGRESS, None)?;
+            self.config_set(BOOTSTRAPPING, None)?;
+            return Ok(mutations);
         };
 
-        let purge = cursor.is_none() && response.cursor.is_none();
-        let last_mutation_id = if purge { response.last_mutation_id } else { 0 };
+        let purge = cursor.is_none() && next_cursor.is_none();
+        let last_mutation_id = if purge { last_mutation_id } else { 0 };
         let mutations = self.revert_changesets(last_mutation_id)?;
 
-        self.record_synced_tables(&response.mutations)?;
-        self.apply_server_state(response.mutations)?;
+        self.record_synced_tables(&changes)?;
+        self.apply_server_state(changes)?;
 
-        match response.cursor {
-            Some(cursor) => {
-                self.config_set(PULL_CURSOR, Some(Value::Text(cursor)))?;
+        match next_cursor {
+            Some(next_cursor) => {
+                self.config_set(PULL_CURSOR, Some(Value::Text(next_cursor)))?;
                 self.config_set(BOOTSTRAPPING, Some(Value::Integer(1)))?;
             }
             None => {
                 self.config_set(PULL_CURSOR, None)?;
-                self.config_set(
-                    SERVER_VERSION,
-                    Some(Value::Integer(response.server_version as i64)),
-                )?;
+                self.config_set(SERVER_VERSION, Some(Value::Text(server_version)))?;
             }
         }
 
@@ -646,7 +624,7 @@ impl SqliteEngine {
                 .connection
                 .prepare_cached("DELETE FROM pending_mutations WHERE id <= ?")?;
             stmt.execute((last_mutation_id as i64,))?;
-        } else if let Some(progress) = response.progress {
+        } else if let Some(progress) = progress {
             let progress =
                 serde_json::to_string(&progress).map_err(|e| WasmError::Serde(e.to_string()))?;
             self.config_set(PULL_PROGRESS, Some(Value::Text(progress)))?;

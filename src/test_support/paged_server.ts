@@ -6,11 +6,12 @@ import type {
 } from "../sync_sqlite/sync_sqlite.js";
 
 /**
- * Fake backend for the tests. Single writer: the number of the last write is the version.
+ * Fake backend for the tests. Single writer: the number of the last write is the version,
+ * sent as a string.
  *
- * - `known_version: 0` with a `limit`: bootstrap by pages, table by table, by id. The
+ * - `known_version: null` with a `limit`: bootstrap by pages, table by table, by id. The
  *   cursor holds V0 and one position per table; the last page answers V0.
- * - `known_version: 0` without `limit`: everything in one response, as before.
+ * - `known_version: null` without `limit`: everything in one response.
  * - otherwise: what changed since `known_version` (tombstones included), in one
  *   response, or `reset` when the tombstones no longer go back that far.
  */
@@ -83,15 +84,15 @@ export class PagedServer {
     if (request.cursor !== undefined) {
       return this.page(JSON.parse(request.cursor), request);
     }
-    if (request.known_version === 0 && request.limit !== undefined) {
+    if (request.known_version === null && request.limit !== undefined) {
       const pos = Object.fromEntries(this.tableOrder.map((t) => [t, 0]));
       return this.page({ v0: this.version, pos, done: 0 }, request);
     }
-    if (request.known_version > 0 && request.known_version < this.historyStart) {
-      return { reset: true };
+    const since = Number(request.known_version ?? 0);
+    if (since > 0 && since < this.historyStart) {
+      return { type: "reset" };
     }
 
-    const since = request.known_version;
     const mutations: TableMutation[] = this.tombstones
       .filter((t) => t.version > since)
       .map(({ table, id }) => ({ op: "delete", table, pks: ["id"], records: [{ id }] }));
@@ -120,8 +121,13 @@ export class PagedServer {
     return { ...response, cursor: JSON.stringify({ ...cursor, pos, done }), progress: { done } };
   };
 
-  private response = (version: number, request: PullRequest, mutations: TableMutation[]) => ({
-    server_version: version,
+  private response = (
+    version: number,
+    request: PullRequest,
+    mutations: TableMutation[],
+  ) => ({
+    type: "changes" as const,
+    server_version: String(version),
     last_mutation_id: this.clients.get(request.client_id) ?? 0,
     mutations,
   });

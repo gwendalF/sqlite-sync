@@ -341,7 +341,8 @@ describe("SyncEngine creation", () => {
       ],
       syncer: {
         pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
-          server_version: 1,
+          type: "changes",
+          server_version: "1",
           last_mutation_id: 0,
           mutations: [],
         }),
@@ -362,7 +363,8 @@ describe("SyncEngine creation", () => {
       push: vi.fn(),
       pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
         last_mutation_id: 0,
-        server_version: 0,
+        type: "changes",
+        server_version: "0",
         mutations: [],
       }),
     };
@@ -531,7 +533,8 @@ describe("have reactive query", () => {
   }) => {
     const syncer = {
       pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
-        server_version: 1,
+        type: "changes",
+        server_version: "1",
         last_mutation_id: 0,
         mutations: [
           {
@@ -574,7 +577,8 @@ describe("SyncEngine allow to sync", () => {
   it("adds data from the server", async ({ expect, hub }) => {
     const syncer = {
       pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
-        server_version: 1,
+        type: "changes",
+        server_version: "1",
         last_mutation_id: 0,
         mutations: [
           {
@@ -603,7 +607,8 @@ describe("SyncEngine allow to sync", () => {
   it("deletes data when server says so", async ({ expect, hub }) => {
     const syncer = {
       pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
-        server_version: 1,
+        type: "changes",
+        server_version: "1",
         last_mutation_id: 0,
         mutations: [
           {
@@ -635,7 +640,8 @@ describe("SyncEngine allow to sync", () => {
   }) => {
     const syncer = {
       pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
-        server_version: 1,
+        type: "changes",
+        server_version: "1",
         last_mutation_id: 0,
         mutations: [
           {
@@ -679,7 +685,8 @@ describe("SyncEngine allow to sync", () => {
   it("replays mutations on server state", async ({ expect, hub }) => {
     const syncer = {
       pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
-        server_version: 1,
+        type: "changes",
+        server_version: "1",
         last_mutation_id: 0,
         mutations: [
           {
@@ -724,7 +731,8 @@ describe("SyncEngine allow to sync", () => {
     const syncer = {
       // the server has applied none of the local mutations yet
       pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
-        server_version: 1,
+        type: "changes",
+        server_version: "1",
         last_mutation_id: 0,
         mutations: [
           {
@@ -763,7 +771,8 @@ describe("SyncEngine allow to sync", () => {
       push: vi.fn(),
       // the server already has a user with the id used by the local mutation
       pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
-        server_version: 1,
+        type: "changes",
+        server_version: "1",
         last_mutation_id: 0,
         mutations: [
           {
@@ -815,7 +824,8 @@ describe("SyncEngine allow to sync", () => {
       pull: vi
         .fn<Syncer["pull"]>()
         .mockResolvedValueOnce({
-          server_version: 1,
+          type: "changes",
+          server_version: "1",
           last_mutation_id: 0,
           mutations: [
             {
@@ -827,7 +837,8 @@ describe("SyncEngine allow to sync", () => {
           ],
         })
         .mockResolvedValueOnce({
-          server_version: 2,
+          type: "changes",
+          server_version: "2",
           last_mutation_id: 0,
           mutations: [
             {
@@ -840,7 +851,8 @@ describe("SyncEngine allow to sync", () => {
         })
         .mockResolvedValueOnce({
           // incremental patch: row 1 did not change on the server
-          server_version: 3,
+          type: "changes",
+          server_version: "3",
           last_mutation_id: 0,
           mutations: [
             {
@@ -887,7 +899,8 @@ describe("SyncEngine allow to sync", () => {
         .fn<Syncer["pull"]>()
         .mockResolvedValueOnce({
           // the server takes the id the local INSERT got
-          server_version: 1,
+          type: "changes",
+          server_version: "1",
           last_mutation_id: 0,
           mutations: [
             {
@@ -899,7 +912,8 @@ describe("SyncEngine allow to sync", () => {
           ],
         })
         .mockResolvedValueOnce({
-          server_version: 2,
+          type: "changes",
+          server_version: "2",
           last_mutation_id: 0,
           mutations: [],
         }),
@@ -927,7 +941,8 @@ describe("SyncEngine allow to sync", () => {
       push: vi.fn(),
       pull: vi.fn<Syncer["pull"]>().mockResolvedValue({
         last_mutation_id: 1,
-        server_version: 1,
+        type: "changes",
+        server_version: "1",
         mutations: [],
       }),
     };
@@ -957,7 +972,8 @@ describe("SyncEngine allow to sync", () => {
 
 describe("onSync", () => {
   const emptyPull: PullResponse = {
-    server_version: 1,
+    type: "changes",
+    server_version: "1",
     last_mutation_id: 0,
     mutations: [],
   };
@@ -1014,8 +1030,9 @@ describe("onSync", () => {
 });
 
 describe("concurrent syncs", () => {
-  const usersAt = (server_version: number, name: string): PullResponse => ({
-    server_version,
+  const usersAt = (version: number, name: string): PullResponse => ({
+    type: "changes",
+    server_version: String(version),
     last_mutation_id: 0,
     mutations: [
       { op: "upsert", table: "users", pks: ["id"], records: [{ id: 1, name }] },
@@ -1055,7 +1072,7 @@ describe("concurrent syncs", () => {
     expect(rows).toMatchObject([{ id: 1, name: "new" }]);
   });
 
-  it("applies a newer pull response arriving after an older one", async ({
+  it("ignores a response to a request made before the state moved, the next sync gets it", async ({
     expect,
     hub,
   }) => {
@@ -1068,11 +1085,21 @@ describe("concurrent syncs", () => {
 
     resolve[0](usersAt(1, "old"));
     await first;
+    // both requests were made with no version: the state has moved since the second one
     resolve[1](usersAt(2, "new"));
     await second;
+    expect((await engine.sql(sql`SELECT name FROM users`)).rows).toEqual([
+      "old",
+    ]);
 
-    const { rows } = await engine.sql(sql`SELECT * FROM users`);
-    expect(rows).toMatchObject([{ id: 1, name: "new" }]);
+    const third = engine.sync();
+    await vi.waitFor(() => expect(syncer.pull).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(syncer.pull).mock.calls[2][0].known_version).toBe("1");
+    resolve[2](usersAt(2, "new"));
+    await third;
+    expect((await engine.sql(sql`SELECT name FROM users`)).rows).toEqual([
+      "new",
+    ]);
   });
 
   it("two tabs can sync at the same time", async ({ expect, hub }) => {
@@ -1186,7 +1213,8 @@ describe("local mutators", () => {
     const syncer: Syncer = {
       push,
       pull: vi.fn<Syncer["pull"]>().mockResolvedValueOnce({
-        server_version: 1,
+        type: "changes",
+        server_version: "1",
         last_mutation_id: 1,
         mutations: [
           {

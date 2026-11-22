@@ -11,7 +11,8 @@ type SqlResult<T = Record<string, unknown>> = {
 
 type PullRequest = {
   client_id: string;
-  known_version: number;
+  /** Version of the last complete pull, as received. `null`: the client has nothing yet. */
+  known_version: string | null;
   /** Set while a partial pull is in progress: the `cursor` of the last page, as received. */
   cursor?: string;
   /** Maximum number of rows the client wants in one response. A hint, see `Config.pullLimit`. */
@@ -22,12 +23,11 @@ type PullRequest = {
 
 type PullProgress = { done: number; total?: number };
 
-/** `reset` tells the two cases apart: `if (response.reset)` narrows the type. */
 type PullResponse =
   | {
-      /** Absent in a normal response: a backend that never resets has nothing to send. */
-      reset?: false;
-      server_version: number;
+      type: "changes";
+      /** Opaque to the client: stored, sent back as `known_version`, never compared. */
+      server_version: string;
       last_mutation_id: number;
       mutations: TableMutation[];
       /**
@@ -41,9 +41,9 @@ type PullResponse =
       /**
        * The server cannot tell what changed since `known_version` (history purged):
        * the client drops its replicated data, keeps its pending mutations and pulls
-       * everything again from `known_version: 0`.
+       * everything again from `known_version: null`.
        */
-      reset: true;
+      type: "reset";
     };
 
 type TableMutation = {
