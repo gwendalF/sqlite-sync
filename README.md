@@ -129,19 +129,25 @@ const { data, unlisten } = await engine.reactiveQuery<{
 
 ### `SyncEngine.create(platform, config)`
 
-| Config       | Type                           | Description                                                                                    |
-| ------------ | ------------------------------ | ---------------------------------------------------------------------------------------------- |
-| `syncer`     | `Syncer`                       | Your transport to the server (see below).                                                      |
-| `mutators`   | `MutatorsConfig`               | Named write functions, usually built with `defineMutators`.                                    |
-| `migrations` | `Migration[]?`                 | `{ version, run(db) }`, applied in order, tracked with `PRAGMA user_version`.                  |
-| `autoSync`   | `boolean?` (default `true`)    | Run `sync()` after each mutation.                                                              |
-| `onSync`     | `(result: SyncResult) => void` | Called after every sync with `{ ok: true }` or `{ ok: false, error }`. Logs errors by default. |
+| Config          | Type                           | Description                                                                                    |
+| --------------- | ------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `syncer`        | `Syncer`                       | Your transport to the server (see below).                                                      |
+| `mutators`      | `MutatorsConfig`               | Named write functions, usually built with `defineMutators`.                                    |
+| `localMutators` | `LocalMutatorsConfig?`         | Named writes to local-only tables, never synced (see [Local mutators](#local-mutators)).       |
+| `migrations`    | `Migration[]?`                 | `{ version, run(db) }`, applied in order, tracked with `PRAGMA user_version`.                  |
+| `autoSync`      | `boolean?` (default `true`)    | Run `sync()` after each mutation.                                                              |
+| `onSync`        | `(result: SyncResult) => void` | Called after every sync with `{ ok: true }` or `{ ok: false, error }`. Logs errors by default. |
 
 Instance methods:
 
 - `engine.mutate.<name>(payload)` – runs the mutator in a transaction, records it for push, and
   notifies reactive queries of the tables it wrote.
-- `engine.sql<T>(query)` – read-only query, resolves to `{ rows: T[] }`.
+- `engine.local.<name>(payload)` – runs a local mutator in a transaction and notifies reactive
+  queries of the tables it wrote. Nothing is recorded for push.
+- `engine.sql<T>(query, { committed? })` – read-only query, resolves to `{ rows: T[] }`. Meant for
+  debugging and one-off reads: by default it does not wait for a running mutation or rebase, so it
+  may see changes that are rolled back afterwards. With `committed: true` it waits for them and
+  only sees committed data. Use `reactiveQuery` to read data, and mutators to write it.
 - `engine.reactiveQuery<T>(query, { onChange, onError? })` – resolves to `{ data, unlisten }`.
   `onChange` is called with fresh rows when a table read by the query changes (locally, in
   another tab, or after a pull).
@@ -169,6 +175,33 @@ defineMutators({
 
 Mutators are re-executed when the client rebases on new server state, so they must only depend on
 their payload and the database content (no `Date.now()`, `Math.random()`, or network calls inside).
+
+### Local mutators
+
+For data that is never synced (settings, UI state...). A local mutator has the same shape as a
+mutator, and runs under the same lock in a transaction, but it is never pushed, reverted or replayed.
+Its payload is never stored, so it does not need to be JSON-safe.
+
+```ts
+SyncEngine.create(platform, {
+  syncer,
+  mutators,
+  localMutators: {
+    setTheme: async (db, theme: string) => {
+      await db.sql(
+        sql`INSERT OR REPLACE INTO settings(key, value) VALUES ('theme', ${theme})`,
+      );
+    },
+  },
+});
+
+await engine.local.setTheme("dark");
+```
+
+Do not write local data in a regular mutator: once the server acknowledges the mutation, its
+changes are reverted and replaced by the server state, which does not hold local tables, so the
+write is lost. Conversely, only write local tables in a local mutator: a change to a synced table is
+never pushed, and the engine cannot tell which tables are synced.
 
 ### `sql` tagged template
 

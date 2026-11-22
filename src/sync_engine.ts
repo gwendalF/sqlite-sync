@@ -1,10 +1,12 @@
 import {
   Config,
   DBHandle,
+  LocalMutatorsArgs,
   Migration,
   MigrationHandle,
   MutatorsConfig,
   PublicMutators,
+  PublicLocalMutators,
   Syncer,
   Query,
   MutatorFn,
@@ -37,7 +39,10 @@ export function sql(
   };
 }
 
-export class SyncEngine<M extends MutatorsConfig> {
+export class SyncEngine<
+  M extends MutatorsConfig,
+  L extends LocalMutatorsArgs = {},
+> {
   private tablesCache = new Map<string, string[]>();
   private listeners = new Set<Listener>();
   private syncer: Syncer;
@@ -51,19 +56,22 @@ export class SyncEngine<M extends MutatorsConfig> {
     }
   >;
   mutate: PublicMutators<M>;
+  /** Writes to local-only tables: never pushed, reverted or replayed. */
+  local: PublicLocalMutators<L>;
 
   private constructor(
     private platform: Platform,
     {
       autoSync = true,
       mutators,
+      localMutators,
       syncer,
       onSync = (result) => {
         if (!result.ok) {
           console.error("syncFailed", result.error);
         }
       },
-    }: Config<M>,
+    }: Config<M, L>,
   ) {
     const publicMutators: Record<string, (payload: unknown) => Promise<void>> =
       {};
@@ -118,13 +126,35 @@ export class SyncEngine<M extends MutatorsConfig> {
 
     this.mutate = publicMutators as unknown as PublicMutators<M>;
     this.rawMutators = rawMutators;
+
+    const local: Record<string, (...args: unknown[]) => Promise<void>> = {};
+    for (const [name, fn] of Object.entries(localMutators ?? {})) {
+      // Same as a mutation, without the session: nothing is recorded for push.
+      local[name] = (...args) =>
+        this.platform.lock(async () => {
+          const written = new Set<string>();
+          try {
+            await this.call("begin");
+            await fn(this.trackingHandle(written), ...args);
+            await this.call("commit");
+          } catch (e) {
+            await this.call("rollback");
+            throw e;
+          }
+          this.notify([...written.keys()]);
+        });
+    }
+    this.local = local as unknown as PublicLocalMutators<L>;
   }
 
-  static create = async <M extends MutatorsConfig>(
+  static create = async <
+    M extends MutatorsConfig,
+    L extends LocalMutatorsArgs = {},
+  >(
     platform: Platform,
-    config: ValidatedConfig<M>,
+    config: ValidatedConfig<M, L>,
   ) => {
-    const engine = new SyncEngine<M>(platform, config);
+    const engine = new SyncEngine<M, L>(platform, config);
     if (config.migrations?.length) {
       await engine.applyMigrations(config.migrations);
     }
@@ -132,7 +162,26 @@ export class SyncEngine<M extends MutatorsConfig> {
     return engine;
   };
 
-  sql = async <T = unknown>({ sql, params = [] }: Query, isReadonly = true) => {
+  /**
+   * Read-only: writes go through mutators, so they run under the lock and are captured.
+   *
+   * By default it does not wait for a running mutation or rebase, so it may see changes
+   * rolled back afterwards. `committed: true` waits for them and only sees committed data.
+   * Takes the task lock: calling it from code that already holds the lock (e.g. through a
+   * closure in a mutator) never resolves.
+   */
+  sql = async <T = unknown>(
+    query: Query,
+    { committed = false }: { committed?: boolean } = {},
+  ) => {
+    const read = () => this.exec<T>(query, true);
+    return committed ? this.platform.lock(read) : read();
+  };
+
+  private exec = async <T = unknown>(
+    { sql, params = [] }: Query,
+    isReadonly: boolean,
+  ) => {
     return this.call("query", {
       sql,
       params,
@@ -274,7 +323,7 @@ export class SyncEngine<M extends MutatorsConfig> {
     return {
       sql: async (query) => {
         const tables = await this.tablesOf(query.sql);
-        const { rows, isReadonly } = await this.sql(query, false);
+        const { rows, isReadonly } = await this.exec(query, false);
         if (!isReadonly && tables.length) {
           tables.forEach((t) => written.add(t));
         }

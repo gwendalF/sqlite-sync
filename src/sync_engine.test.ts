@@ -8,6 +8,7 @@ import {
   MigrationHandle,
   MutatorFn,
   MutatorsConfig,
+  Query,
   ValidatedConfig,
 } from "./config";
 import { Platform } from "./platform/platform";
@@ -35,6 +36,11 @@ async function getUserVersion(core: SqliteDB): Promise<number> {
   });
 
   return version as number;
+}
+
+/** Writes outside any mutator, which `engine.sql` does not allow */
+function write(platform: Platform, { sql, params = [] }: Query) {
+  return platform.call("query", { sql, params, isReadonly: false });
 }
 
 type testMut = { addUser: MutatorFn<string> };
@@ -176,6 +182,65 @@ describe("SyncEngine creation", () => {
     expect(
       (await engine.sql({ sql: "SELECT * FROM users" })).rows,
     ).toMatchObject([{ id: 1, name: "John Doe" }]);
+  });
+
+  it("engine.sql rejects writes: they must go through a mutator", async ({
+    expect,
+    hub,
+  }) => {
+    const engine = await buildEngine(hub.newTab());
+
+    await expect(
+      engine.sql({
+        sql: "INSERT INTO users(name) VALUES (?)",
+        params: ["John Doe"],
+      }),
+    ).rejects.toThrow(/not read only/);
+    expect(
+      (await engine.sql({ sql: "SELECT COUNT(*) FROM users" })).rows[0],
+    ).toBe(0);
+  });
+
+  it("engine.sql only sees committed data when asked to", async ({
+    expect,
+    hub,
+  }) => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let signalWritten!: () => void;
+    const written = new Promise<void>((r) => (signalWritten = r));
+
+    const engine = await buildEngine(hub.newTab(), {
+      autoSync: false,
+      mutators: {
+        addThenFail: async (h: DBHandle) => {
+          await h.sql(sql`INSERT INTO users(name) VALUES ('rolled back')`);
+          signalWritten();
+          await gate;
+          throw new Error("abort");
+        },
+      },
+    });
+    const count = sql`SELECT COUNT(*) FROM users`;
+
+    const mutation = engine.mutate.addThenFail();
+    await written;
+
+    // default: does not wait, sees the row of the running mutation
+    expect((await engine.sql(count)).rows[0]).toBe(1);
+
+    // committed: waits for the mutation to end, then sees it rolled back
+    let settled = false;
+    const committed = engine.sql(count, { committed: true }).then((r) => {
+      settled = true;
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settled).toBe(false);
+
+    release();
+    await expect(mutation).rejects.toThrow("abort");
+    expect((await committed).rows[0]).toBe(0);
   });
 
   it("rejection on mutator does not block queued mutators", async ({
@@ -552,10 +617,11 @@ describe("SyncEngine allow to sync", () => {
       push: vi.fn(),
     };
 
-    const engine = await buildEngine(hub.newTab(), { syncer });
-    await engine.sql(
+    const tab = hub.newTab();
+    const engine = await buildEngine(tab, { syncer });
+    await write(
+      tab,
       sql`INSERT INTO users(id, name) VALUES (${1}, 'Jane'), (2, ${"John"}), (3, 'Not deleted')`,
-      false,
     );
 
     await engine.sync();
@@ -586,7 +652,8 @@ describe("SyncEngine allow to sync", () => {
       push: vi.fn(),
     };
 
-    const engine = await buildEngine(hub.newTab(), {
+    const tab = hub.newTab();
+    const engine = await buildEngine(tab, {
       syncer,
       migrations: [
         {
@@ -599,9 +666,9 @@ describe("SyncEngine allow to sync", () => {
         },
       ],
     });
-    await engine.sql(
+    await write(
+      tab,
       sql`INSERT INTO users(name,age) VALUES ('Jane', 20), (${"John"}, ${20}), ('Me', 32)`,
-      false,
     );
 
     await engine.sync();
@@ -1045,5 +1112,156 @@ describe("sql function", () => {
     },
   ])("sql for %j", ({ query, params, sql }, { expect }) => {
     expect(query()).toMatchObject({ sql, params });
+  });
+});
+
+describe("local mutators", () => {
+  const settingsEngine = (platform: Platform, syncer: Syncer = stubSyncer) =>
+    SyncEngine.create(platform, {
+      syncer,
+      autoSync: false,
+      mutators: {
+        addUser: async (db: DBHandle, name: string) => {
+          await db.sql(sql`INSERT INTO users(name) VALUES (${name})`);
+        },
+      },
+      localMutators: {
+        setTheme: async (db: DBHandle, theme: string) => {
+          await db.sql(
+            sql`INSERT OR REPLACE INTO settings(key, value) VALUES ('theme', ${theme})`,
+          );
+        },
+        failAfterWrite: async (db: DBHandle) => {
+          await db.sql(
+            sql`INSERT OR REPLACE INTO settings(key, value) VALUES ('theme', 'lost')`,
+          );
+          throw new Error("abort");
+        },
+      },
+      migrations: [
+        {
+          version: 1,
+          run: async (db: MigrationHandle) => {
+            await db.exec(
+              `CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+               CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT);`,
+            );
+          },
+        },
+      ],
+    });
+
+  const theme = sql`SELECT value FROM settings WHERE key = 'theme'`;
+
+  it("writes and notifies reactive queries, without recording a mutation", async ({
+    expect,
+    hub,
+  }) => {
+    const tab = hub.newTab();
+    const engine = await settingsEngine(tab);
+    const onChange = vi.fn();
+    await engine.reactiveQuery<string>(theme, { onChange });
+
+    await engine.local.setTheme("dark");
+    await hub.settle();
+
+    expect(onChange).toHaveBeenLastCalledWith(["dark"]);
+    const request = await tab.call("pushRequest");
+    expect(request.mutations).toEqual([]);
+  });
+
+  it("is rolled back when it throws", async ({ expect, hub }) => {
+    const engine = await settingsEngine(hub.newTab());
+    await engine.local.setTheme("dark");
+
+    await expect(engine.local.failAfterWrite()).rejects.toThrow("abort");
+    expect((await engine.sql(theme)).rows).toEqual(["dark"]);
+  });
+
+  it("survives a rebase acknowledging a pending mutation", async ({
+    expect,
+    hub,
+  }) => {
+    const push = vi.fn<Syncer["push"]>();
+    const syncer: Syncer = {
+      push,
+      pull: vi.fn<Syncer["pull"]>().mockResolvedValueOnce({
+        server_version: 1,
+        last_mutation_id: 1,
+        mutations: [
+          {
+            op: "upsert",
+            table: "users",
+            pks: ["id"],
+            records: [{ id: 1, name: "John" }],
+          },
+        ],
+      }),
+    };
+    const engine = await settingsEngine(hub.newTab(), syncer);
+
+    await engine.mutate.addUser("John");
+    await engine.local.setTheme("dark");
+    await engine.sync();
+
+    expect(push.mock.calls[0][0].mutations).toMatchObject([
+      { name: "addUser" },
+    ]);
+    expect((await engine.sql(theme)).rows).toEqual(["dark"]);
+    expect((await engine.sql(sql`SELECT name FROM users`)).rows).toEqual([
+      "John",
+    ]);
+  });
+});
+
+describe("local mutators types", () => {
+  it("are inferred from the config", async ({ expect, hub }) => {
+    const engine = await SyncEngine.create(hub.newTab(), {
+      syncer: stubSyncer,
+      autoSync: false,
+      mutators: {},
+      localMutators: {
+        // db is not annotated: inferred as DBHandle
+        setTheme: async (db, theme: string) => {
+          await db.sql(sql`SELECT ${theme}`);
+        },
+        setSize: async (_db, _size: { w: number; h: number }) => {},
+        reset: async (_db) => {},
+        // payloads are never stored: they do not need to be JSON-safe
+        setDate: async (_db, _date: Date) => {},
+      },
+    });
+
+    // only checked by tsc, never run
+    const typed = async () => {
+      await engine.local.setTheme("dark");
+      await engine.local.setSize({ w: 1, h: 2 });
+      await engine.local.reset();
+      await engine.local.setDate(new Date());
+      // @ts-expect-error wrong payload type
+      await engine.local.setTheme(42);
+      // @ts-expect-error missing payload
+      await engine.local.setTheme();
+      // @ts-expect-error wrong object shape
+      await engine.local.setSize({ w: 1 });
+      // @ts-expect-error extra argument
+      await engine.local.reset("x");
+      // @ts-expect-error unknown local mutator
+      await engine.local.nope();
+      // @ts-expect-error a local mutator is not on engine.mutate
+      await engine.mutate.setTheme("dark");
+    };
+    void typed;
+
+    const withoutLocal = await buildEngine(hub.newTab());
+    // @ts-expect-error no local mutators configured
+    void withoutLocal.local.reset;
+
+    expect(Object.keys(engine.local).sort()).toEqual([
+      "reset",
+      "setDate",
+      "setSize",
+      "setTheme",
+    ]);
   });
 });

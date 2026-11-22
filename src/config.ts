@@ -51,9 +51,34 @@ export type PublicMutators<M extends MutatorsConfig> = {
   [K in keyof M]: (...args: PayloadArgs<M[K]>) => Promise<void>;
 };
 
-export type Config<M extends MutatorsConfig = MutatorsConfig> = {
+/**
+ * Mutators of local-only tables (settings, UI state...): run under the lock in a
+ * transaction and notify reactive queries, but are never pushed, reverted or replayed.
+ * Their payload is never stored, so it does not need to be JSON-safe.
+ */
+export type LocalMutatorsConfig<
+  L extends LocalMutatorsArgs = LocalMutatorsArgs,
+> = {
+  [K in keyof L]: (db: DBHandle, ...args: L[K]) => Promise<void>;
+};
+
+/**
+ * Payload arguments of each local mutator. Inferred from the functions themselves, so
+ * `db` is typed without annotation and the payload type comes from the function.
+ */
+export type LocalMutatorsArgs = Record<string, unknown[]>;
+
+export type PublicLocalMutators<L extends LocalMutatorsArgs> = {
+  [K in keyof L]: (...args: L[K]) => Promise<void>;
+};
+
+export type Config<
+  M extends MutatorsConfig = MutatorsConfig,
+  L extends LocalMutatorsArgs = {},
+> = {
   syncer: Syncer;
   mutators: M;
+  localMutators?: LocalMutatorsConfig<L>;
   migrations?: Migration[];
   autoSync?: boolean;
   onSync?: (result: SyncResult) => void;
@@ -61,7 +86,10 @@ export type Config<M extends MutatorsConfig = MutatorsConfig> = {
 
 export type SyncResult = { ok: true } | { ok: false; error: unknown };
 
-export type ValidatedConfig<M extends MutatorsConfig> = Config<M> & {
+export type ValidatedConfig<
+  M extends MutatorsConfig,
+  L extends LocalMutatorsArgs = {},
+> = Config<M, L> & {
   mutators: NoInfer<ValidateMutators<M>>;
 };
 

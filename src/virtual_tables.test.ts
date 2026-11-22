@@ -2,7 +2,13 @@ import { describe, test as baseTest, vi } from "vitest";
 import { sql, SyncEngine } from "./sync_engine";
 import { Syncer } from "./syncer";
 import { PullResponse } from "./sync_sqlite/sync_sqlite";
-import { DBHandle, MigrationHandle, MutatorsConfig, ValidatedConfig } from "./config";
+import {
+  DBHandle,
+  MigrationHandle,
+  MutatorsConfig,
+  Query,
+  ValidatedConfig,
+} from "./config";
 import { createTestHub } from "./testing";
 
 const it = baseTest.extend("hub", async () => {
@@ -78,7 +84,8 @@ async function setup<M extends MutatorsConfig>(
   mutators: M,
 ) {
   const pull = vi.fn<Syncer["pull"]>();
-  const engine = await SyncEngine.create(hub.newTab(), {
+  const platform = hub.newTab();
+  const engine = await SyncEngine.create(platform, {
     syncer: { pull, push: vi.fn<Syncer["push"]>() },
     mutators,
     autoSync: false,
@@ -96,7 +103,11 @@ async function setup<M extends MutatorsConfig>(
     await engine.sync();
   };
 
-  return { engine, sync };
+  /** Writes outside any mutator, which `engine.sql` does not allow */
+  const write = ({ sql, params = [] }: Query) =>
+    platform.call("query", { sql, params, isReadonly: false });
+
+  return { engine, sync, write };
 }
 
 const upsert = (...records: Doc[]): Mutation => ({
@@ -121,6 +132,7 @@ const words = (doc: Doc) => `${doc.title} ${doc.body}`.split(" ");
  */
 async function expectIndexInSync(
   engine: { sql: SyncEngine<any>["sql"] },
+  write: (query: Query) => Promise<unknown>,
   expect: (typeof import("vitest"))["expect"],
   vocabulary: Iterable<string>,
 ) {
@@ -141,10 +153,7 @@ async function expectIndexInSync(
   expect(found).toEqual(expected);
 
   await expect(
-    engine.sql(
-      sql`INSERT INTO docs_fts(docs_fts, rank) VALUES ('integrity-check', 1)`,
-      false,
-    ),
+    write(sql`INSERT INTO docs_fts(docs_fts, rank) VALUES ('integrity-check', 1)`),
   ).resolves.toBeDefined();
 }
 
@@ -184,8 +193,8 @@ describe.each(variants)("FTS5 $name kept in sync by triggers", (variant) => {
     expect,
     hub,
   }) => {
-    const { engine, sync } = await build(hub);
-    const check = () => expectIndexInSync(engine, expect, vocabulary);
+    const { engine, sync, write } = await build(hub);
+    const check = () => expectIndexInSync(engine, write, expect, vocabulary);
 
     await engine.mutate.addDoc(local);
     await check();
@@ -209,8 +218,8 @@ describe.each(variants)("FTS5 $name kept in sync by triggers", (variant) => {
     expect,
     hub,
   }) => {
-    const { engine, sync } = await build(hub);
-    const check = () => expectIndexInSync(engine, expect, vocabulary);
+    const { engine, sync, write } = await build(hub);
+    const check = () => expectIndexInSync(engine, write, expect, vocabulary);
 
     await sync(0, upsert(alpha, beta, gamma));
     await check();
@@ -233,8 +242,8 @@ describe.each(variants)("FTS5 $name kept in sync by triggers", (variant) => {
     expect,
     hub,
   }) => {
-    const { engine, sync } = await build(hub);
-    const check = () => expectIndexInSync(engine, expect, vocabulary);
+    const { engine, sync, write } = await build(hub);
+    const check = () => expectIndexInSync(engine, write, expect, vocabulary);
 
     await sync(0, upsert(alpha, beta, gamma));
     await engine.mutate.editDoc({ id: alpha.id, body: "blue cherry" });
@@ -255,7 +264,7 @@ describe.each(variants)("FTS5 $name kept in sync by triggers", (variant) => {
     expect,
     hub,
   }) => {
-    const { engine, sync } = await build(hub);
+    const { engine, sync, write } = await build(hub);
     const fruits = [...vocabulary];
     const text = (n: number) =>
       [0, 1, 2].map((i) => fruits[(n * 7 + i * 3) % fruits.length]).join(" ");
@@ -283,7 +292,7 @@ describe.each(variants)("FTS5 $name kept in sync by triggers", (variant) => {
         ),
         remove(round - 2),
       );
-      await expectIndexInSync(engine, expect, vocabulary);
+      await expectIndexInSync(engine, write, expect, vocabulary);
     }
   });
 });
