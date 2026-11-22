@@ -201,6 +201,48 @@ describe("SyncEngine creation", () => {
     ).toBe(0);
   });
 
+  it("engine.sql only sees committed data when asked to", async ({
+    expect,
+    hub,
+  }) => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let signalWritten!: () => void;
+    const written = new Promise<void>((r) => (signalWritten = r));
+
+    const engine = await buildEngine(hub.newTab(), {
+      autoSync: false,
+      mutators: {
+        addThenFail: async (h: DBHandle) => {
+          await h.sql(sql`INSERT INTO users(name) VALUES ('rolled back')`);
+          signalWritten();
+          await gate;
+          throw new Error("abort");
+        },
+      },
+    });
+    const count = sql`SELECT COUNT(*) FROM users`;
+
+    const mutation = engine.mutate.addThenFail();
+    await written;
+
+    // default: does not wait, sees the row of the running mutation
+    expect((await engine.sql(count)).rows[0]).toBe(1);
+
+    // committed: waits for the mutation to end, then sees it rolled back
+    let settled = false;
+    const committed = engine.sql(count, { committed: true }).then((r) => {
+      settled = true;
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settled).toBe(false);
+
+    release();
+    await expect(mutation).rejects.toThrow("abort");
+    expect((await committed).rows[0]).toBe(0);
+  });
+
   it("rejection on mutator does not block queued mutators", async ({
     expect,
     hub,

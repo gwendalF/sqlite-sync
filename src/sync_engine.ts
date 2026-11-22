@@ -132,9 +132,19 @@ export class SyncEngine<M extends MutatorsConfig> {
     return engine;
   };
 
-  /** Read-only: writes go through mutators, so they run under the lock and are captured. */
-  sql = async <T = unknown>(query: Query) => {
-    return this.exec<T>(query, true);
+  /**
+   * Read-only: writes go through mutators, so they run under the lock and are captured.
+   *
+   * By default it does not wait for a running mutation or rebase, so it may see changes
+   * rolled back afterwards. `committed: true` waits for them and only sees committed data.
+   * Do not set it from inside a mutator: the lock is already held and would never be freed.
+   */
+  sql = async <T = unknown>(
+    query: Query,
+    { committed = false }: { committed?: boolean } = {},
+  ) => {
+    const read = () => this.exec<T>(query, true);
+    return committed ? this.platform.lock(read) : read();
   };
 
   private exec = async <T = unknown>(
