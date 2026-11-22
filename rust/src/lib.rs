@@ -552,10 +552,12 @@ impl SqliteEngine {
         }
 
         self.connection.prepare_cached("BEGIN")?.execute(())?;
-        let mutations = self.rebase_on(&request, response).map_err(|e| RollbackErr {
-            reason: e.to_string(),
-            conn: &self.connection,
-        })?;
+        let mutations = self
+            .rebase_on(&request.cursor, response)
+            .map_err(|e| RollbackErr {
+                reason: e.to_string(),
+                conn: &self.connection,
+            })?;
 
         let response: Vec<_> = mutations
             .into_iter()
@@ -576,13 +578,14 @@ impl SqliteEngine {
 
     /// Reverts the pending mutations and writes the response, in the open transaction.
     /// Returns the mutations to replay.
-    fn rebase_on(&self, request: &PullRequestEcho, response: PullResponse) -> Result<Vec<Mutation>> {
+    fn rebase_on(&self, cursor: &Option<String>, response: PullResponse) -> Result<Vec<Mutation>> {
         use rusqlite::types::Value;
 
         // a page may hold a row before the row it references
-        self.connection.execute("PRAGMA defer_foreign_keys = ON", ())?;
+        self.connection
+            .execute("PRAGMA defer_foreign_keys = ON", ())?;
 
-        let purge = !response.reset && request.cursor.is_none() && response.cursor.is_none();
+        let purge = !response.reset && cursor.is_none() && response.cursor.is_none();
         let last_mutation_id = if purge { response.last_mutation_id } else { 0 };
         let mutations = self.revert_changesets(last_mutation_id)?;
 
@@ -620,7 +623,8 @@ impl SqliteEngine {
                 .prepare_cached("DELETE FROM pending_mutations WHERE id <= ?")?;
             stmt.execute((last_mutation_id as i64,))?;
         } else if let Some(progress) = response.progress {
-            let progress = serde_json::to_string(&progress).map_err(|e| WasmError::Serde(e.to_string()))?;
+            let progress =
+                serde_json::to_string(&progress).map_err(|e| WasmError::Serde(e.to_string()))?;
             self.config_set(PULL_PROGRESS, Some(Value::Text(progress)))?;
         }
 
@@ -639,7 +643,8 @@ impl SqliteEngine {
         let before = tables.len();
         tables.extend(mutations.iter().map(|m| m.table.clone()));
         if tables.len() != before {
-            let json = serde_json::to_string(&tables).map_err(|e| WasmError::Serde(e.to_string()))?;
+            let json =
+                serde_json::to_string(&tables).map_err(|e| WasmError::Serde(e.to_string()))?;
             self.config_set(SYNCED_TABLES, Some(rusqlite::types::Value::Text(json)))?;
         }
         Ok(())

@@ -1,18 +1,11 @@
-import { describe, test as baseTest, vi } from "vitest";
+import { describe, test as baseTest, vi, ExpectStatic } from "vitest";
 import { sql, SyncEngine } from "./sync_engine";
 import { Syncer } from "./syncer";
 import { DBHandle, Query, ValidatedConfig } from "./config";
 import { createTestHub } from "./testing";
 import { PagedServer, Row, ServerMutators } from "./test_support/paged_server";
-import type {
-  PullRequest,
-  PullResponse,
-} from "./sync_sqlite/sync_sqlite";
+import type { PullRequest, PullResponse } from "./sync_sqlite/sync_sqlite";
 import type { SyncState } from "./messages";
-
-const it = baseTest.extend("hub", async () => {
-  return createTestHub();
-});
 
 type Hub = Awaited<ReturnType<typeof createTestHub>>;
 
@@ -93,7 +86,7 @@ async function localRows(engine: SyncEngine<any>, table: string) {
 }
 
 async function expectSameAsServer(
-  expect: any,
+  expect: ExpectStatic,
   engine: SyncEngine<any>,
   server: PagedServer,
 ) {
@@ -132,12 +125,20 @@ const label = async (engine: SyncEngine<any>, id: number) => {
   return rows[0];
 };
 
+const it = baseTest
+  .extend("hub", async () => {
+    return createTestHub();
+  })
+  .extend("server", () => {
+    return seededServer();
+  });
+
 describe("backend without cursor", () => {
   it("is pulled once, with the same request as before", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const { syncer } = connect(server);
     const engine = await buildEngine(hub, { syncer });
 
@@ -159,8 +160,8 @@ describe("partial pull", () => {
   it("bootstraps an empty database in several pages, then catches up from V0", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const { syncer } = connect(server);
     const engine = await buildEngine(hub, { syncer, pullLimit: 4 });
 
@@ -183,8 +184,7 @@ describe("partial pull", () => {
     expect(await storedCursor(hub)).toBeUndefined();
   });
 
-  it("sends the cursor back as received", async ({ expect, hub }) => {
-    const server = seededServer();
+  it("sends the cursor back as received", async ({ expect, hub, server }) => {
     const { syncer, responses } = connect(server);
     const engine = await buildEngine(hub, { syncer, pullLimit: 4 });
 
@@ -201,8 +201,8 @@ describe("partial pull", () => {
   it("corrects a row modified on the server after it was sent", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const { syncer } = connect(server, async (n) => {
       if (n === 1) server.update("invoices", 1, { label: "B" });
       if (n === 8) expect(await label(engine, 1)).toBe("invoice 1");
@@ -220,8 +220,8 @@ describe("partial pull", () => {
   it("removes rows deleted on the server, already sent or not", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const { syncer } = connect(server, (n) => {
       if (n === 1) {
         server.delete("invoices", 1); // sent by the first page
@@ -241,10 +241,11 @@ describe("partial pull", () => {
   it("keeps one row, with its last value, for a row created during the bootstrap and received twice", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const { syncer, responses } = connect(server, (n) => {
-      if (n === 1) server.upsert("invoices", { id: 11, label: "new", amount: 1 });
+      if (n === 1)
+        server.upsert("invoices", { id: 11, label: "new", amount: 1 });
       if (n === 5) server.update("invoices", 11, { label: "new v2" });
     });
     const engine = await buildEngine(hub, { syncer, pullLimit: 4 });
@@ -253,7 +254,9 @@ describe("partial pull", () => {
 
     const sent = responses.flatMap((r) =>
       "mutations" in r
-        ? r.mutations.flatMap((m) => m.records.filter((rec) => rec.id === 11 && m.table === "invoices"))
+        ? r.mutations.flatMap((m) =>
+            m.records.filter((rec) => rec.id === 11 && m.table === "invoices"),
+          )
         : [],
     );
     expect(sent).toHaveLength(2); // by the bootstrap, then by the incremental pull
@@ -267,8 +270,8 @@ describe("partial pull", () => {
   it("keeps a pushed mutation visible after each page, and only purges it after the catch-up", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const seen: { label1: string; label9?: string; pending: number }[] = [];
     const { syncer, responses } = connect(server, async (n) => {
       if (n === 1) {
@@ -291,7 +294,9 @@ describe("partial pull", () => {
 
     // every page after the push acknowledges both mutations
     expect(
-      responses.slice(1).every((r) => "last_mutation_id" in r && r.last_mutation_id === 2),
+      responses
+        .slice(1)
+        .every((r) => "last_mutation_id" in r && r.last_mutation_id === 2),
     ).toBe(true);
     // a page holds the server state from V0: without the replay, invoice 1 would show its old label
     expect(seen.length).toBe(7);
@@ -310,11 +315,12 @@ describe("partial pull", () => {
   it("keeps pushing during the bootstrap, and converges with the syncs mutations start", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const { syncer } = connect(server, async (n) => {
       if (n === 2) await engine.mutate.renameInvoice({ id: 2, label: "auto" });
-      if (n === 5) await engine.mutate.addInvoice({ id: 50, label: "x", amount: 5 });
+      if (n === 5)
+        await engine.mutate.addInvoice({ id: 50, label: "x", amount: 5 });
     });
     const engine = await buildEngine(hub, {
       syncer,
@@ -336,8 +342,8 @@ describe("partial pull", () => {
   it("resumes from the stored cursor after an interruption", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const failing = connect(server, (n) => {
       if (n === 3) throw Error("network down");
     });
@@ -359,7 +365,10 @@ describe("partial pull", () => {
 
     // another tab, as after a reload
     const resumed = connect(server);
-    const engine = await buildEngine(hub, { syncer: resumed.syncer, pullLimit: 4 });
+    const engine = await buildEngine(hub, {
+      syncer: resumed.syncer,
+      pullLimit: 4,
+    });
     await engine.sync();
 
     const firstRequest = vi.mocked(resumed.syncer.pull).mock.calls[0][0];
@@ -372,8 +381,8 @@ describe("partial pull", () => {
   it("notifies the reactive queries after each page", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const { syncer } = connect(server);
     const engine = await buildEngine(hub, { syncer, pullLimit: 4 });
 
@@ -390,11 +399,20 @@ describe("partial pull", () => {
     await hub.settle();
 
     expect(onInvoices.mock.calls).toEqual([[[4]], [[8]], [[10]]]);
-    expect(onEntries.mock.calls).toEqual([[[4]], [[8]], [[12]], [[16]], [[20]]]);
+    expect(onEntries.mock.calls).toEqual([
+      [[4]],
+      [[8]],
+      [[12]],
+      [[16]],
+      [[20]],
+    ]);
   });
 
-  it("reports the sync state after each page", async ({ expect, hub }) => {
-    const server = seededServer();
+  it("reports the sync state after each page", async ({
+    expect,
+    hub,
+    server,
+  }) => {
     const { syncer } = connect(server);
     const engine = await buildEngine(hub, { syncer, pullLimit: 4 });
 
@@ -423,7 +441,12 @@ describe("partial pull", () => {
       server_version: 50, // ignored on a page
       last_mutation_id: 0,
       mutations: [
-        { op: "upsert", table: "invoices", pks: ["id"], records: [{ id, label, amount: 0 }] },
+        {
+          op: "upsert",
+          table: "invoices",
+          pks: ["id"],
+          records: [{ id, label, amount: 0 }],
+        },
       ],
     });
     const pull = vi
@@ -433,8 +456,15 @@ describe("partial pull", () => {
       .mockResolvedValueOnce({ ...upsert(2, "b"), cursor: "c1" })
       .mockResolvedValueOnce({ ...upsert(3, "c"), cursor: "c2" })
       .mockResolvedValueOnce({ ...upsert(4, "d"), server_version: 40 })
-      .mockResolvedValueOnce({ server_version: 41, last_mutation_id: 0, mutations: [] });
-    const engine = await buildEngine(hub, { syncer: { pull, push: vi.fn() }, pullLimit: 1 });
+      .mockResolvedValueOnce({
+        server_version: 41,
+        last_mutation_id: 0,
+        mutations: [],
+      });
+    const engine = await buildEngine(hub, {
+      syncer: { pull, push: vi.fn() },
+      pullLimit: 1,
+    });
 
     await engine.sync();
     await engine.sync();
@@ -458,8 +488,8 @@ describe("partial pull", () => {
   it("ignores a page answering a cursor that is no longer the current one", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const { syncer } = connect(server);
     const engine = await buildEngine(hub, { syncer, pullLimit: 4 });
 
@@ -474,8 +504,8 @@ describe("reset", () => {
   it("drops the replicated data, keeps the pending mutations and bootstraps again", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const { syncer } = connect(server);
     const engine = await buildEngine(hub, {
       syncer,
@@ -485,7 +515,10 @@ describe("reset", () => {
     await engine.sync();
 
     // a row the server never sent: only a reset removes it
-    await write(hub, sql`INSERT INTO invoices(id, label, amount) VALUES (999, 'stray', 0)`);
+    await write(
+      hub,
+      sql`INSERT INTO invoices(id, label, amount) VALUES (999, 'stray', 0)`,
+    );
     // pending, never acknowledged: its push fails
     vi.mocked(syncer.push).mockRejectedValue(Error("push failed"));
     await engine.mutate.renameInvoice({ id: 1, label: "mine" });
@@ -523,15 +556,17 @@ describe("reset", () => {
     await expectSameAsServer(expect, engine, server);
   });
 
-  it("keeps the local-only tables", async ({ expect, hub }) => {
-    const server = seededServer();
+  it("keeps the local-only tables", async ({ expect, hub, server }) => {
     const { syncer } = connect(server);
     const engine = await buildEngine(hub, {
       syncer,
       migrations: [
         {
           version: 1,
-          run: (db) => db.exec(`${SCHEMA} CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT);`),
+          run: (db) =>
+            db.exec(
+              `${SCHEMA} CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT);`,
+            ),
         },
       ],
     });
@@ -549,8 +584,11 @@ describe("reset", () => {
     await expectSameAsServer(expect, engine, server);
   });
 
-  it("is ignored when it answers a stale request", async ({ expect, hub }) => {
-    const server = seededServer();
+  it("is ignored when it answers a stale request", async ({
+    expect,
+    hub,
+    server,
+  }) => {
     const { syncer } = connect(server);
     const engine = await buildEngine(hub, { syncer });
     await engine.sync();
@@ -583,8 +621,18 @@ describe("foreign keys", () => {
         server_version: 1,
         last_mutation_id: 0,
         mutations: [
-          { op: "upsert", table: "lines", pks: ["id"], records: [{ id: 1, invoice_id: 1 }] },
-          { op: "upsert", table: "invoices", pks: ["id"], records: [{ id: 1 }] },
+          {
+            op: "upsert",
+            table: "lines",
+            pks: ["id"],
+            records: [{ id: 1, invoice_id: 1 }],
+          },
+          {
+            op: "upsert",
+            table: "invoices",
+            pks: ["id"],
+            records: [{ id: 1 }],
+          },
         ],
       }),
     };
@@ -615,15 +663,17 @@ describe("priority", () => {
   const scanned = (responses: PullResponse[]) =>
     responses.flatMap((r) =>
       "mutations" in r && ("cursor" in r || r.server_version === 30)
-        ? r.mutations.flatMap((m) => m.records.map((rec) => `${m.table}#${rec.id}`))
+        ? r.mutations.flatMap((m) =>
+            m.records.map((rec) => `${m.table}#${rec.id}`),
+          )
         : [],
     );
 
   it("asks first for the tables of the mounted reactive queries, latest first", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     const { syncer, responses } = connect(server);
     const engine = await buildEngine(hub, { syncer, pullLimit: 4 });
 
@@ -642,8 +692,11 @@ describe("priority", () => {
     await expectSameAsServer(expect, engine, server);
   });
 
-  it("does not send a priority on incremental pulls", async ({ expect, hub }) => {
-    const server = seededServer();
+  it("does not send a priority on incremental pulls", async ({
+    expect,
+    hub,
+    server,
+  }) => {
     const { syncer } = connect(server);
     const engine = await buildEngine(hub, { syncer });
     await engine.reactiveQuery(sql`SELECT count(*) FROM invoices`, {
@@ -664,8 +717,8 @@ describe("priority", () => {
   it("loses and repeats no row when the mounted queries change during the bootstrap", async ({
     expect,
     hub,
+    server,
   }) => {
-    const server = seededServer();
     let unlisten = () => {};
     const { syncer, responses } = connect(server, async (n) => {
       // a hook runs once the n-th request is built: it changes the next one
