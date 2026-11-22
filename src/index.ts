@@ -5,6 +5,8 @@ export type {
   MutatorFn,
   MutatorsConfig,
   LocalMutatorsConfig,
+  LocalMutatorsArgs,
+  PublicLocalMutators,
   Syncer,
   DBHandle,
   Migration,

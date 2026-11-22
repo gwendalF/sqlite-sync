@@ -1,11 +1,12 @@
 import {
   Config,
   DBHandle,
-  LocalMutatorsConfig,
+  LocalMutatorsArgs,
   Migration,
   MigrationHandle,
   MutatorsConfig,
   PublicMutators,
+  PublicLocalMutators,
   Syncer,
   Query,
   MutatorFn,
@@ -40,7 +41,7 @@ export function sql(
 
 export class SyncEngine<
   M extends MutatorsConfig,
-  L extends LocalMutatorsConfig = {},
+  L extends LocalMutatorsArgs = {},
 > {
   private tablesCache = new Map<string, string[]>();
   private listeners = new Set<Listener>();
@@ -56,7 +57,7 @@ export class SyncEngine<
   >;
   mutate: PublicMutators<M>;
   /** Writes to local-only tables: never pushed, reverted or replayed. */
-  local: PublicMutators<L>;
+  local: PublicLocalMutators<L>;
 
   private constructor(
     private platform: Platform,
@@ -126,15 +127,15 @@ export class SyncEngine<
     this.mutate = publicMutators as unknown as PublicMutators<M>;
     this.rawMutators = rawMutators;
 
-    const local: Record<string, (payload: unknown) => Promise<void>> = {};
+    const local: Record<string, (...args: unknown[]) => Promise<void>> = {};
     for (const [name, fn] of Object.entries(localMutators ?? {})) {
       // Same as a mutation, without the session: nothing is recorded for push.
-      local[name] = (payload) =>
+      local[name] = (...args) =>
         this.platform.lock(async () => {
           const written = new Set<string>();
           try {
             await this.call("begin");
-            await fn(this.trackingHandle(written), payload);
+            await fn(this.trackingHandle(written), ...args);
             await this.call("commit");
           } catch (e) {
             await this.call("rollback");
@@ -143,12 +144,12 @@ export class SyncEngine<
           this.notify([...written.keys()]);
         });
     }
-    this.local = local as unknown as PublicMutators<L>;
+    this.local = local as unknown as PublicLocalMutators<L>;
   }
 
   static create = async <
     M extends MutatorsConfig,
-    L extends LocalMutatorsConfig = {},
+    L extends LocalMutatorsArgs = {},
   >(
     platform: Platform,
     config: ValidatedConfig<M, L>,

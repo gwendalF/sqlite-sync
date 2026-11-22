@@ -1213,3 +1213,55 @@ describe("local mutators", () => {
     ]);
   });
 });
+
+describe("local mutators types", () => {
+  it("are inferred from the config", async ({ expect, hub }) => {
+    const engine = await SyncEngine.create(hub.newTab(), {
+      syncer: stubSyncer,
+      autoSync: false,
+      mutators: {},
+      localMutators: {
+        // db is not annotated: inferred as DBHandle
+        setTheme: async (db, theme: string) => {
+          await db.sql(sql`SELECT ${theme}`);
+        },
+        setSize: async (_db, _size: { w: number; h: number }) => {},
+        reset: async (_db) => {},
+        // payloads are never stored: they do not need to be JSON-safe
+        setDate: async (_db, _date: Date) => {},
+      },
+    });
+
+    // only checked by tsc, never run
+    const typed = async () => {
+      await engine.local.setTheme("dark");
+      await engine.local.setSize({ w: 1, h: 2 });
+      await engine.local.reset();
+      await engine.local.setDate(new Date());
+      // @ts-expect-error wrong payload type
+      await engine.local.setTheme(42);
+      // @ts-expect-error missing payload
+      await engine.local.setTheme();
+      // @ts-expect-error wrong object shape
+      await engine.local.setSize({ w: 1 });
+      // @ts-expect-error extra argument
+      await engine.local.reset("x");
+      // @ts-expect-error unknown local mutator
+      await engine.local.nope();
+      // @ts-expect-error a local mutator is not on engine.mutate
+      await engine.mutate.setTheme("dark");
+    };
+    void typed;
+
+    const withoutLocal = await buildEngine(hub.newTab());
+    // @ts-expect-error no local mutators configured
+    void withoutLocal.local.reset;
+
+    expect(Object.keys(engine.local).sort()).toEqual([
+      "reset",
+      "setDate",
+      "setSize",
+      "setTheme",
+    ]);
+  });
+});
