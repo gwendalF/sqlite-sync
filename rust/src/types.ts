@@ -22,8 +22,11 @@ type PullRequest = {
 
 type PullProgress = { done: number; total?: number };
 
+/** `reset` tells the two cases apart: `if (response.reset)` narrows the type. */
 type PullResponse =
   | {
+      /** Absent in a normal response: a backend that never resets has nothing to send. */
+      reset?: false;
       server_version: number;
       last_mutation_id: number;
       mutations: TableMutation[];

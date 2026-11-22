@@ -170,26 +170,42 @@ pub struct PullRequest {
 #[derive(Deserialize)]
 pub struct PullRequestEcho {
     known_version: usize,
-    #[serde(default)]
     cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct PullResponse {
-    #[serde(default)]
     server_version: usize,
-    #[serde(default)]
     last_mutation_id: usize,
-    #[serde(default)]
     mutations: Vec<TableMutation>,
     /// Present on a partial response: pull again with it.
-    #[serde(default)]
     cursor: Option<String>,
-    #[serde(default)]
     progress: Option<serde_json::Value>,
-    /// The server cannot answer from `known_version`: drop the replicated data.
+}
+
+/// Read first: `{ reset: true }` has none of the fields of a normal response,
+/// which are then all required.
+#[derive(Deserialize)]
+struct ResetFlag {
     #[serde(default)]
     reset: bool,
+}
+
+/// What the server answered.
+enum Pulled {
+    /// It cannot answer from `known_version`: drop the replicated data.
+    Reset,
+    Changes(PullResponse),
+}
+
+impl Pulled {
+    fn from_js(value: wasm_bindgen::JsValue) -> Result<Self> {
+        let flag: ResetFlag = serde_wasm_bindgen::from_value(value.clone())?;
+        if flag.reset {
+            return Ok(Pulled::Reset);
+        }
+        Ok(Pulled::Changes(serde_wasm_bindgen::from_value(value)?))
+    }
 }
 
 #[derive(Serialize)]
@@ -538,16 +554,19 @@ impl SqliteEngine {
         response: JsPullResponse,
     ) -> Result<Option<JsLocalMutations>> {
         let request: PullRequestEcho = serde_wasm_bindgen::from_value(request.into())?;
-        let response: PullResponse = serde_wasm_bindgen::from_value(response.into())?;
+        let response = Pulled::from_js(response.into())?;
         if request.cursor != self.cursor {
             return Ok(None);
         }
-        let partial = response.cursor.is_some();
-        if response.reset || partial {
-            if request.known_version != self.server_version {
-                return Ok(None);
+        let stale = match &response {
+            // a reset or a page only makes sense for the state the request was made on
+            Pulled::Reset => request.known_version != self.server_version,
+            Pulled::Changes(r) if r.cursor.is_some() => {
+                request.known_version != self.server_version
             }
-        } else if response.server_version < self.server_version {
+            Pulled::Changes(r) => r.server_version < self.server_version,
+        };
+        if stale {
             return Ok(None);
         }
 
@@ -578,25 +597,30 @@ impl SqliteEngine {
 
     /// Reverts the pending mutations and writes the response, in the open transaction.
     /// Returns the mutations to replay.
-    fn rebase_on(&self, cursor: &Option<String>, response: PullResponse) -> Result<Vec<Mutation>> {
+    fn rebase_on(&self, cursor: &Option<String>, response: Pulled) -> Result<Vec<Mutation>> {
         use rusqlite::types::Value;
 
         // a page may hold a row before the row it references
         self.connection
             .execute("PRAGMA defer_foreign_keys = ON", ())?;
 
-        let purge = !response.reset && cursor.is_none() && response.cursor.is_none();
+        let response = match response {
+            Pulled::Reset => {
+                // no purge: the pending mutations are replayed on the empty tables
+                let mutations = self.revert_changesets(0)?;
+                self.clear_replicated_tables()?;
+                self.config_set(SERVER_VERSION, Some(Value::Integer(0)))?;
+                self.config_set(PULL_CURSOR, None)?;
+                self.config_set(PULL_PROGRESS, None)?;
+                self.config_set(BOOTSTRAPPING, None)?;
+                return Ok(mutations);
+            }
+            Pulled::Changes(response) => response,
+        };
+
+        let purge = cursor.is_none() && response.cursor.is_none();
         let last_mutation_id = if purge { response.last_mutation_id } else { 0 };
         let mutations = self.revert_changesets(last_mutation_id)?;
-
-        if response.reset {
-            self.clear_replicated_tables()?;
-            self.config_set(SERVER_VERSION, Some(Value::Integer(0)))?;
-            self.config_set(PULL_CURSOR, None)?;
-            self.config_set(PULL_PROGRESS, None)?;
-            self.config_set(BOOTSTRAPPING, None)?;
-            return Ok(mutations);
-        }
 
         self.record_synced_tables(&response.mutations)?;
         self.apply_server_state(response.mutations)?;

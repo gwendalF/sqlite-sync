@@ -289,7 +289,6 @@ export class SyncEngine<
       }
     }
     const response = await this.syncer.pull(request);
-    const reset = "reset" in response && response.reset === true;
 
     return this.platform.lock(async () => {
       const mutations = await this.call("startRebase", { request, response });
@@ -300,7 +299,7 @@ export class SyncEngine<
       let changes: Changes;
       try {
         const updated = new Set(
-          "mutations" in response ? response.mutations.map((m) => m.table) : [],
+          response.reset ? [] : response.mutations.map((m) => m.table),
         );
         for (const mutation of mutations) {
           const { fn, deserialize } = this.rawMutators[mutation.name];
@@ -314,7 +313,7 @@ export class SyncEngine<
           await this.call("endReplay", mutation.id);
         }
         await this.call("endRebase");
-        changes = reset ? "*" : [...updated.keys()];
+        changes = response.reset ? "*" : [...updated.keys()];
       } catch (e) {
         await this.call("rollback");
         throw e;
@@ -323,9 +322,9 @@ export class SyncEngine<
       this.notify(changes);
       await this.emitSyncState();
       return (
-        reset ||
+        response.reset ||
         request.cursor !== undefined ||
-        ("cursor" in response && response.cursor !== undefined)
+        response.cursor !== undefined
       );
     });
   };
