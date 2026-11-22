@@ -23,6 +23,8 @@ export type RpcMethods = {
   beginPull: { args: undefined; result: PullRequest };
   startRebase: { args: PullResponse; result: LocalMutations };
   endRebase: { args: number; result: void };
+  startCapture: { args: undefined; result: void };
+  endReplay: { args: number; result: void };
   query: {
     args: RustQuery;
     result: { rows: unknown[]; isReadonly: boolean };

@@ -114,6 +114,7 @@ pub struct PullResponse {
 
 #[derive(Serialize)]
 pub struct LocalMutation {
+    id: usize,
     name: String,
     args: Option<serde_json::Value>,
 }
@@ -366,12 +367,12 @@ impl SqliteEngine {
                 conn: &self.connection,
             })?;
 
-        let mutations = self
-            .rever_changesets(response.last_mutation_id)
-            .map_err(|e| RollbackErr {
-                reason: e.to_string(),
-                conn: &self.connection,
-            })?;
+        // Every pending mutation is reverted, acknowledged ones included: the
+        // local state is back to the last server state the client received.
+        let mut mutations = self.rever_changesets().map_err(|e| RollbackErr {
+            reason: e.to_string(),
+            conn: &self.connection,
+        })?;
 
         self.apply_server_state(response.mutations)
             .map_err(|e| RollbackErr {
@@ -379,9 +380,25 @@ impl SqliteEngine {
                 conn: &self.connection,
             })?;
 
+        // Acknowledged mutations are now part of the server state: drop them so
+        // they are never reverted again. Relies on AUTOINCREMENT ids (never reused).
+        let last_mutation_id = response.last_mutation_id;
+        self.connection
+            .prepare_cached("DELETE FROM pending_mutations WHERE id <= ?")
+            .and_then(|mut stmt| stmt.execute((last_mutation_id as i64,)))
+            .map_err(|e| RollbackErr {
+                reason: e.to_string(),
+                conn: &self.connection,
+            })?;
+
+        // Replay in original order (revert needed the reverse order).
+        mutations.retain(|m| m.id > last_mutation_id);
+        mutations.sort_by_key(|m| m.id);
+
         let response: Vec<_> = mutations
             .into_iter()
             .map(|m| LocalMutation {
+                id: m.id,
                 name: m.name,
                 args: m.args,
             })
@@ -404,29 +421,47 @@ impl SqliteEngine {
 
     #[wasm_bindgen]
     pub fn start_mutate(&mut self) -> Result<()> {
+        if matches!(self.push_state, PushState::InProgress { .. }) {
+            return Err(WasmError::Other(String::from("capture already in progress")));
+        }
         self.connection.execute("BEGIN", ())?;
-        let mut session = Session::new(&self.connection).map_err(|e| RollbackErr {
-            reason: e.to_string(),
-            conn: &self.connection,
-        })?;
-        session.attach::<&str>(None).map_err(|e| RollbackErr {
-            reason: e.to_string(),
-            conn: &self.connection,
-        })?;
-
-        // we can assume static lifetime because connection is held by the struct and pin
-        // clippy warn but we extend the lifetime so the as is necessary
-        #[allow(clippy::unnecessary_cast)]
-        let session = Box::into_raw(Box::new(session)) as *mut Session<'static>;
-
-        let session = NonNull::new(session).unwrap();
-        self.push_state = PushState::InProgress { session };
+        if let Err(e) = self.open_session() {
+            let _ = self.connection.execute("ROLLBACK", ());
+            return Err(e);
+        }
         Ok(())
     }
 
+    /// Start recording the changes of a replayed mutation. No BEGIN: replays
+    /// run inside the transaction opened by `start_rebasing`.
     #[wasm_bindgen]
-    pub fn rollback(&self) -> Result<()> {
-        self.connection.execute("ROLLBACK", ())?;
+    pub fn start_capture(&mut self) -> Result<()> {
+        if matches!(self.push_state, PushState::InProgress { .. }) {
+            return Err(WasmError::Other(String::from("capture already in progress")));
+        }
+        self.open_session()
+    }
+
+    /// Store the changeset of a replayed mutation, computed on the new base,
+    /// so the next rebase reverts what the replay actually did.
+    #[wasm_bindgen]
+    pub fn end_replay(&mut self, id: usize) -> Result<()> {
+        let inverted_changeset = self.close_session()?;
+        let mut stmt = self
+            .connection
+            .prepare_cached("UPDATE pending_mutations SET changeset = ? WHERE id = ?")?;
+        stmt.execute(params![inverted_changeset, id as i64])?;
+        Ok(())
+    }
+
+    /// Abort the current mutation or rebase: frees the session if any and
+    /// rolls back if a transaction is open. Safe to call in any state.
+    #[wasm_bindgen]
+    pub fn rollback(&mut self) -> Result<()> {
+        drop(self.take_session());
+        if !self.connection.is_autocommit() {
+            self.connection.execute("ROLLBACK", ())?;
+        }
         Ok(())
     }
 
@@ -444,32 +479,52 @@ impl SqliteEngine {
 
     #[wasm_bindgen]
     pub fn end_mutate(&mut self, name: &str, args: Option<String>) -> Result<()> {
-        match self.push_state {
-            PushState::Idle => return Err(WasmError::Other(String::from("not in mutation"))),
-            PushState::InProgress { session } => {
-                {
-                    // session is valid since it has not moved and the connection is pinned so has not moved either
-                    let mut session = unsafe { Box::from_raw(session.as_ptr()) };
-                    let mut changeset = vec![];
-
-                    session.changeset_strm(&mut changeset)?;
-                    let mut inverted_changeset = Vec::with_capacity(changeset.len());
-                    let mut input = changeset.as_slice();
-                    invert_strm(&mut input, &mut inverted_changeset)?;
-
-                    let mut stmt = self.connection.prepare_cached(
-                    "INSERT INTO pending_mutations (name, args, changeset) VALUES (?, jsonb(?), ?)",
-                )?;
-
-                    stmt.execute(params![name, args, inverted_changeset])?;
-                }
-
-                self.connection.execute("COMMIT", ())?;
-                self.push_state = PushState::Idle;
-            }
-        };
-
+        let inverted_changeset = self.close_session()?;
+        let mut stmt = self.connection.prepare_cached(
+            "INSERT INTO pending_mutations (name, args, changeset) VALUES (?, jsonb(?), ?)",
+        )?;
+        stmt.execute(params![name, args, inverted_changeset])?;
+        self.connection.execute("COMMIT", ())?;
         Ok(())
+    }
+
+    fn open_session(&mut self) -> Result<()> {
+        let mut session = Session::new(&self.connection)?;
+        session.attach::<&str>(None)?;
+
+        // we can assume static lifetime because connection is held by the struct and pin
+        // clippy warn but we extend the lifetime so the as is necessary
+        #[allow(clippy::unnecessary_cast)]
+        let session = Box::into_raw(Box::new(session)) as *mut Session<'static>;
+
+        let session = NonNull::new(session).unwrap();
+        self.push_state = PushState::InProgress { session };
+        Ok(())
+    }
+
+    /// Takes the session out of `push_state` first, so an error later on can
+    /// never leave a dangling pointer behind.
+    fn take_session(&mut self) -> Option<Box<Session<'static>>> {
+        match std::mem::replace(&mut self.push_state, PushState::Idle) {
+            PushState::Idle => None,
+            // session is valid since it has not moved and the connection is pinned so has not moved either
+            PushState::InProgress { session } => Some(unsafe { Box::from_raw(session.as_ptr()) }),
+        }
+    }
+
+    /// Ends the capture and returns the inverted changeset.
+    fn close_session(&mut self) -> Result<Vec<u8>> {
+        let mut session = self
+            .take_session()
+            .ok_or_else(|| WasmError::Other(String::from("not in mutation")))?;
+        let mut changeset = vec![];
+        session.changeset_strm(&mut changeset)?;
+        drop(session);
+
+        let mut inverted_changeset = Vec::with_capacity(changeset.len());
+        let mut input = changeset.as_slice();
+        invert_strm(&mut input, &mut inverted_changeset)?;
+        Ok(inverted_changeset)
     }
 
     #[wasm_bindgen]
@@ -478,12 +533,13 @@ impl SqliteEngine {
         Ok(data.to_vec())
     }
 
-    fn rever_changesets(&self, last_mutation_id: usize) -> rusqlite::Result<Vec<Mutation>> {
+    /// Reverts every pending mutation, newest first, and returns them in that order.
+    fn rever_changesets(&self) -> rusqlite::Result<Vec<Mutation>> {
         let mut stmt = self.connection.prepare_cached(
             "SELECT id, name, json(args), changeset FROM pending_mutations ORDER by id DESC",
         )?;
 
-        let mut changes: Vec<Mutation> = stmt
+        let changes: Vec<Mutation> = stmt
             .query_map((), |row| {
                 let args = row.get_ref(2)?.as_str_or_null()?;
                 let value = match args {
@@ -516,7 +572,6 @@ impl SqliteEngine {
                     rusqlite::session::ConflictAction::SQLITE_CHANGESET_ABORT
                 })?;
         }
-        changes.retain(|mutation| mutation.id > last_mutation_id);
         Ok(changes)
     }
 

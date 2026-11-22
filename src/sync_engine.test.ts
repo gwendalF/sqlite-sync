@@ -501,6 +501,163 @@ describe("SyncEngine allow to sync", () => {
       { id: 2, name: "ME" },
     ]); // mutation applied
   });
+
+  it("notifies reactive queries with server data", async ({ expect, hub }) => {
+    const puller = {
+      pull: vi.fn<Puller["pull"]>().mockResolvedValue({
+        server_version: 1,
+        last_mutation_id: 0,
+        mutations: [
+          {
+            op: "upsert",
+            table: "users",
+            pks: ["id"],
+            records: [{ id: 1, name: "John" }],
+          },
+        ],
+      }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), { puller });
+    const onChange = vi.fn();
+    await engine.reactiveQuery<number>(sql`SELECT COUNT(*) FROM users`, {
+      onChange,
+    });
+
+    await engine.sync();
+    await vi.waitFor(() => expect(onChange).toHaveBeenCalledWith([1]));
+  });
+
+  it("drops acknowledged mutations", async ({ expect, hub }) => {
+    const puller = {
+      pull: vi
+        .fn<Puller["pull"]>()
+        .mockResolvedValueOnce({
+          server_version: 1,
+          last_mutation_id: 1,
+          mutations: [
+            {
+              op: "upsert",
+              table: "users",
+              pks: ["id"],
+              records: [{ id: 1, name: "John Doe" }],
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          server_version: 2,
+          last_mutation_id: 1,
+          mutations: [
+            {
+              op: "upsert",
+              table: "users",
+              pks: ["id"],
+              records: [{ id: 2, name: "Other" }],
+            },
+          ],
+        }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), { puller });
+    await engine.mutate.addUser("John Doe");
+    await engine.sync();
+    // the row of the acknowledged mutation is not in this patch: it must stay
+    await engine.sync();
+
+    const {
+      rows: [pending],
+    } = await engine.sql<number>(sql`SELECT COUNT(*) FROM pending_mutations`);
+    expect(pending).toBe(0);
+
+    const { rows } = await engine.sql(sql`SELECT * FROM users ORDER BY id`);
+    expect(rows).toMatchObject([
+      { id: 1, name: "John Doe" },
+      { id: 2, name: "Other" },
+    ]);
+  });
+
+  it("replays pending mutations in order", async ({ expect, hub }) => {
+    const puller = {
+      pull: vi.fn<Puller["pull"]>().mockResolvedValue({
+        server_version: 1,
+        last_mutation_id: 0,
+        mutations: [],
+      }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), {
+      puller,
+      mutators: {
+        addUser: async (h: DBHandle, name: string) => {
+          await h.sql(sql`INSERT INTO users(name) VALUES (${name})`);
+        },
+        rename: async (h: DBHandle, [from, to]: [string, string]) => {
+          await h.sql(sql`UPDATE users SET name = ${to} WHERE name = ${from}`);
+        },
+      },
+    });
+
+    await engine.mutate.addUser("a");
+    await engine.mutate.rename(["a", "b"]);
+    await engine.sync();
+
+    const { rows } = await engine.sql(sql`SELECT name FROM users`);
+    expect(rows).toEqual(["b"]);
+  });
+
+  it("keeps syncing after the server changed a row of a pending mutation", async ({
+    expect,
+    hub,
+  }) => {
+    const puller = {
+      pull: vi
+        .fn<Puller["pull"]>()
+        .mockResolvedValueOnce({
+          server_version: 1,
+          last_mutation_id: 0,
+          mutations: [
+            {
+              op: "upsert",
+              table: "users",
+              pks: ["id"],
+              records: [{ id: 1, name: "Bob" }],
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          server_version: 2,
+          last_mutation_id: 0,
+          mutations: [
+            {
+              op: "upsert",
+              table: "users",
+              pks: ["id"],
+              records: [{ id: 2, name: "Alice" }],
+            },
+          ],
+        }),
+    };
+
+    const engine = await buildEngine(hub.newTab(), {
+      puller,
+      mutators: {
+        upperFirst: async (h: DBHandle) => {
+          await h.sql(sql`UPDATE users SET name = upper(name) WHERE id = 1`);
+        },
+      },
+    });
+
+    await engine.sql(sql`INSERT INTO users(id, name) VALUES (1, 'john')`, false);
+    await engine.mutate.upperFirst();
+    await engine.sync();
+    await expect(engine.sync()).resolves.toBeUndefined();
+
+    const { rows } = await engine.sql(sql`SELECT * FROM users ORDER BY id`);
+    expect(rows).toMatchObject([
+      { id: 1, name: "BOB" },
+      { id: 2, name: "Alice" },
+    ]);
+  });
 });
 
 describe("sql function", () => {

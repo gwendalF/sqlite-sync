@@ -165,12 +165,22 @@ export class SyncEngine<M extends MutatorsConfig> {
     const endVersion = response.server_version;
 
     await this.plateform.lock(async () => {
-      const mutations = await this.call("startRebase", response);
-      const updated = new Set<string>();
-      for (const mutation of mutations) {
-        await this.rawMutators[mutation.name](updated, mutation.args);
+      // startRebase applies the server patch: its tables changed too.
+      const updated = new Set<string>(response.mutations.map((m) => m.table));
+      try {
+        const mutations = await this.call("startRebase", response);
+        for (const mutation of mutations) {
+          // Recapture the changeset: the replay runs on a new base, so the
+          // stored one would no longer revert what is actually in the DB.
+          await this.call("startCapture", undefined);
+          await this.rawMutators[mutation.name](updated, mutation.args);
+          await this.call("endReplay", mutation.id);
+        }
+        await this.call("endRebase", endVersion);
+      } catch (e) {
+        await this.call("rollback", undefined);
+        throw e;
       }
-      await this.call("endRebase", endVersion);
       this.notify([...updated.keys()]);
     });
   }
