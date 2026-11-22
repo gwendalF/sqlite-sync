@@ -50,6 +50,7 @@ import {
   SyncEngine,
   defineMutators,
   sql,
+  type DBHandle,
   type Syncer,
 } from "@gwendalf/sync-sqlite";
 
@@ -69,12 +70,12 @@ const syncer: Syncer = {
 
 // 2. Every write is a named mutator. It must be deterministic: it is replayed after each pull.
 const mutators = defineMutators({
-  addTodo: async (db, todo: { id: string; title: string }) => {
+  addTodo: async (db: DBHandle, todo: { id: string; title: string }) => {
     await db.sql(
       sql`INSERT INTO todos (id, title, done) VALUES (${todo.id}, ${todo.title}, 0)`,
     );
   },
-  toggleTodo: async (db, id: string) => {
+  toggleTodo: async (db: DBHandle, id: string) => {
     await db.sql(sql`UPDATE todos SET done = NOT done WHERE id = ${id}`);
   },
 });
@@ -158,14 +159,15 @@ Instance methods:
 
 ### Mutators
 
-A mutator is `async (db, payload) => void`, where `db.sql(query)` runs any SQL statement. Payloads
+A mutator is `async (db: DBHandle, payload) => void`, where `db.sql(query)` runs any SQL statement.
+Annotate `db` as `DBHandle`: it is not inferred, because the payload type is checked instead. Payloads
 are stored and sent to the server as JSON, so their type must be JSON-safe (checked at compile
 time). For other types, give a deserializer:
 
 ```ts
 defineMutators({
   setDueDate: {
-    fn: async (db, p: { id: string; due: Date }) => {
+    fn: async (db: DBHandle, p: { id: string; due: Date }) => {
       /* ... */
     },
     deserialize: (raw: any) => ({ ...raw, due: new Date(raw.due) }),
