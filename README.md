@@ -20,9 +20,9 @@ rebase).
 ## Installation
 
 ```sh
-npm install sync-sqlite
+npm install @gwendalf/sync-sqlite
 # or
-pnpm add sync-sqlite
+pnpm add @gwendalf/sync-sqlite
 ```
 
 The package ships a `.wasm` file and a worker loaded with `new URL(..., import.meta.url)`, so use a
@@ -36,7 +36,7 @@ import wasm from "vite-plugin-wasm";
 
 export default {
   plugins: [wasm()],
-  optimizeDeps: { exclude: ["sync-sqlite"] },
+  optimizeDeps: { exclude: ["@gwendalf/sync-sqlite"] },
 };
 ```
 
@@ -51,7 +51,7 @@ import {
   defineMutators,
   sql,
   type Syncer,
-} from "sync-sqlite";
+} from "@gwendalf/sync-sqlite";
 
 // 1. How the client talks to your server
 const syncer: Syncer = {
@@ -224,12 +224,12 @@ top. Stale responses (older than the state already applied) are ignored.
 
 ## Testing
 
-`sync-sqlite/testing` provides `createTestHub()` to run the engine in Node (e.g. with Vitest) with
+`@gwendalf/sync-sqlite/testing` provides `createTestHub()` to run the engine in Node (e.g. with Vitest) with
 an in-memory database and simulated tabs:
 
 ```ts
-import { createTestHub } from "sync-sqlite/testing";
-import { SyncEngine } from "sync-sqlite";
+import { createTestHub } from "@gwendalf/sync-sqlite/testing";
+import { SyncEngine } from "@gwendalf/sync-sqlite";
 
 const hub = await createTestHub();
 const engine = await SyncEngine.create(hub.newTab(), {
